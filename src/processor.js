@@ -12,6 +12,11 @@ async function processPost(post) {
   console.log(`Processing post: ${post.$id} - ${post.trackname || 'Untitled'}`);
   
   try {
+    // Обновляем статус обработки
+    await appwrite.updatePostWithProcessedAudio(post.$id, {
+      processing_status: 'processing'
+    });
+    
     // Extract WAV file ID from audio_url
     const audioUrl = post.audio_url;
     const wavFileId = audioUrl.split('/files/')[1].split('/')[0];
@@ -28,16 +33,25 @@ async function processPost(post) {
     console.log(`Downloading WAV file: ${wavFileId}`);
     await appwrite.downloadFile(wavFileId, wavPath);
     
+    // Step 1.5: Validate the audio file
+    console.log(`Validating audio file: ${wavPath}`);
+    try {
+      const audioInfo = await audioProcessor.validateAudioFile(wavPath);
+      console.log(`Audio validation successful: ${JSON.stringify(audioInfo)}`);
+    } catch (validationError) {
+      throw new Error(`Audio validation failed: ${validationError.message}`);
+    }
+    
     // Step 2: Convert WAV to MP3
-    console.log(`Converting WAV to MP3: ${wavPath}`);
+    console.log(`Converting WAV to MP3 with 192k bitrate: ${wavPath}`);
     const mp3Path = await audioProcessor.convertWavToMp3(wavPath, mp3Filename);
     
     // Step 3: Upload MP3 to Appwrite
     console.log(`Uploading MP3 to Appwrite: ${mp3Path}`);
     const mp3FileId = await appwrite.uploadFile(mp3Path, mp3Filename);
     
-    // Step 4: Create HLS segments and playlist
-    console.log(`Creating HLS segments for: ${mp3Path}`);
+    // Step 4: Create HLS segments and playlist (also with 192k bitrate)
+    console.log(`Creating HLS segments with 192k bitrate for: ${mp3Path}`);
     const hlsResult = await audioProcessor.createHlsSegments(mp3Path, baseName);
     
     // Step 5: Upload segments to Appwrite
@@ -77,7 +91,9 @@ async function processPost(post) {
       mp3_url: `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${process.env.APPWRITE_BUCKET_ID}/files/${mp3FileId}/view?project=${process.env.APPWRITE_PROJECT_ID}`,
       m3u8_url: `${process.env.APPWRITE_ENDPOINT}/storage/buckets/${process.env.APPWRITE_BUCKET_ID}/files/${playlistFileId}/view?project=${process.env.APPWRITE_PROJECT_ID}`,
       segments: JSON.stringify(Object.values(segmentFileIds)),
-      streaming_urls: streamingUrls
+      streaming_urls: streamingUrls,
+      processing_status: 'completed',
+      processing_completed_at: new Date().toISOString()
     });
     
     // Step 9: Clean up temporary files
@@ -96,8 +112,63 @@ async function processPost(post) {
     return true;
   } catch (error) {
     console.error(`Error processing post ${post.$id}:`, error);
+    
+    // Обновляем пост с информацией об ошибке
+    try {
+      await appwrite.updatePostWithProcessedAudio(post.$id, {
+        processing_status: 'failed',
+        processing_error: error.message
+      });
+    } catch (updateError) {
+      console.error(`Failed to update post status: ${updateError.message}`);
+    }
+    
     return false;
   }
+}
+
+// Функция для обработки поста с повторными попытками
+async function processPostWithRetry(post, maxRetries = 3) {
+  let retries = 0;
+  while (retries < maxRetries) {
+    try {
+      console.log(`Processing attempt ${retries + 1}/${maxRetries} for post ${post.$id}`);
+      const result = await processPost(post);
+      if (result) return true;
+      
+      // Если processPost вернул false, но не выбросил ошибку - увеличиваем счетчик
+      retries++;
+      
+      if (retries < maxRetries) {
+        const waitTime = 5000 * Math.pow(2, retries); // Экспоненциальное увеличение времени ожидания
+        console.log(`Waiting ${waitTime/1000} seconds before next attempt...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    } catch (error) {
+      console.error(`Attempt ${retries + 1} failed with error:`, error);
+      retries++;
+      
+      if (retries < maxRetries) {
+        const waitTime = 5000 * Math.pow(2, retries);
+        console.log(`Waiting ${waitTime/1000} seconds before next attempt...`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+  }
+  
+  console.error(`All ${maxRetries} attempts failed for post ${post.$id}`);
+  
+  // Обновляем пост с финальной информацией об ошибке
+  try {
+    await appwrite.updatePostWithProcessedAudio(post.$id, {
+      processing_status: 'failed',
+      processing_error: `Failed after ${maxRetries} attempts`
+    });
+  } catch (updateError) {
+    console.error(`Failed to update final post status: ${updateError.message}`);
+  }
+  
+  return false;
 }
 
 // Main processing function
@@ -115,9 +186,9 @@ async function processUnprocessedPosts() {
     
     console.log(`Found ${posts.length} unprocessed posts. Starting processing...`);
     
-    // Process each post
+    // Process each post with retry mechanism
     for (const post of posts) {
-      await processPost(post);
+      await processPostWithRetry(post);
     }
     
     console.log('Finished processing all posts.');
@@ -128,5 +199,6 @@ async function processUnprocessedPosts() {
 
 module.exports = {
   processPost,
+  processPostWithRetry,
   processUnprocessedPosts
 }; 

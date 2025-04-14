@@ -55,7 +55,7 @@ const createHlsSegments = async (mp3Path, outputBasename) => {
   return new Promise((resolve, reject) => {
     ffmpeg(mp3Path)
       .audioCodec('aac')
-      .audioBitrate('128k')
+      .audioBitrate('192k')
       .format('hls')
       .outputOptions([
         '-hls_time 10', // Each segment is 10 seconds long
@@ -115,10 +115,36 @@ const cleanupTempFiles = async (filePaths) => {
   }
 };
 
+// Validate audio file to ensure it's a proper WAV file
+const validateAudioFile = async (filePath) => {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, metadata) => {
+      if (err) {
+        reject(new Error(`Invalid audio file: ${err.message}`));
+        return;
+      }
+      
+      // Проверка на наличие аудио-потока
+      const audioStreams = metadata.streams.filter(s => s.codec_type === 'audio');
+      if (audioStreams.length === 0) {
+        reject(new Error('No audio stream found in the file'));
+        return;
+      }
+      
+      resolve({
+        duration: metadata.format.duration,
+        bitrate: metadata.format.bit_rate,
+        codec: audioStreams[0].codec_name
+      });
+    });
+  });
+};
+
 module.exports = {
   convertWavToMp3,
   createHlsSegments,
   generateAppwritePlaylist,
   cleanupTempFiles,
-  ensureTempDir
+  ensureTempDir,
+  validateAudioFile
 }; 
