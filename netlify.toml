@@ -3,16 +3,15 @@
   functions = "functions-build"
   publish = "public"
 
-# Scheduled function that runs every 15 minutes
-[[functions]]
-  name = "scheduled-processor"
-  schedule = "*/15 * * * *"
-  path = "functions/scheduled-processor"
+[functions]
+  directory = "functions-build"
 
-# Webhook function for real-time processing
-[[functions]]
-  name = "webhook-processor"
-  path = "functions/webhook-processor"
+# Define scheduled function with cron schedule
+[functions.scheduled-processor]
+  schedule = "*/15 * * * *"
+
+# No special configuration needed for webhook function
+# It is automatically included based on the file name
 
 [dev]
   autoLaunch = false 
