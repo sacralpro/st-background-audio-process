@@ -1,5 +1,5 @@
-// Appwrite Function template for audio processing
-// This code can be used in an Appwrite Function to process audio files
+// Appwrite Function for audio processing
+// Optimized for direct calls from Sacral Track application
 
 const sdk = require('node-appwrite');
 const ffmpeg = require('fluent-ffmpeg');
@@ -11,7 +11,7 @@ const readFileAsync = promisify(fs.readFile);
 const unlinkAsync = promisify(fs.unlink);
 const mkdirAsync = promisify(fs.mkdir);
 
-// This is an Appwrite Function that can be deployed directly to Appwrite
+// Main entry point for Appwrite Function
 module.exports = async function(req, res) {
   // Initialize Appwrite SDK
   const client = new sdk.Client();
@@ -36,11 +36,36 @@ module.exports = async function(req, res) {
   const storage = new sdk.Storage(client);
   
   try {
-    // Parse the function payload (you can set this when creating the function trigger)
-    const payload = req.body || {};
-    const { postId } = payload;
+    console.log('Starting audio processing function...');
     
-    if (!postId) {
+    // Handle different types of triggers
+    // 1. Direct API call from Sacral Track (with postId in payload)
+    // 2. Webhook event (for document create/update)
+    // 3. Scheduled execution (not used anymore, but handled for backward compatibility)
+    
+    const payload = req.body || {};
+    let postId;
+    
+    // Case 1: Direct API call with postId
+    if (payload.postId) {
+      postId = payload.postId;
+      console.log(`Direct call to process post: ${postId}`);
+    } 
+    // Case 2: Event trigger (document creation/update)
+    else if (payload.event && payload.payload && payload.payload.$id) {
+      if (payload.event.includes('documents') && 
+          (payload.event.includes('create') || payload.event.includes('update'))) {
+        postId = payload.payload.$id;
+        console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+      } else {
+        return res.json({
+          success: false,
+          message: 'Unsupported event type'
+        });
+      }
+    } 
+    // No valid trigger found
+    else {
       return res.json({
         success: false,
         message: 'Missing postId in payload'
@@ -48,6 +73,7 @@ module.exports = async function(req, res) {
     }
     
     // Get the post from database
+    console.log(`Fetching post document: ${postId}`);
     const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -55,12 +81,35 @@ module.exports = async function(req, res) {
     );
     
     // Check if post needs processing
-    if (!post.audio_url || post.mp3_url) {
+    if (!post.audio_url) {
+      console.log(`Post ${postId} has no audio file to process`);
       return res.json({
-        success: true,
-        message: 'Post already processed or has no audio file'
+        success: false,
+        message: 'Post has no audio file to process'
       });
     }
+    
+    if (post.mp3_url) {
+      console.log(`Post ${postId} is already processed`);
+      return res.json({
+        success: true,
+        message: 'Post already processed',
+        mp3_url: post.mp3_url,
+        m3u8_url: post.m3u8_url
+      });
+    }
+    
+    // Update status to processing
+    console.log(`Updating post ${postId} status to processing`);
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_status: 'processing',
+        processing_started_at: new Date().toISOString()
+      }
+    );
     
     // Create temp directory for processing
     const tempDir = '/tmp/audio-processing';
@@ -68,31 +117,61 @@ module.exports = async function(req, res) {
     
     // Extract file ID from audio_url
     const audioUrl = post.audio_url;
+    console.log(`Original audio URL: ${audioUrl}`);
     const wavFileId = audioUrl.split('/files/')[1].split('/')[0];
+    console.log(`Extracted file ID: ${wavFileId}`);
     
     // Create base name for files
     const baseName = `track_${post.$id}`;
     const wavPath = path.join(tempDir, `${baseName}.wav`);
     const mp3Path = path.join(tempDir, `${baseName}.mp3`);
     
-    // Download WAV file
+    // Step 1: Download WAV file
+    console.log(`Downloading audio file: ${wavFileId}`);
     const fileBlob = await storage.getFileDownload(APPWRITE_BUCKET_ID, wavFileId);
     const arrayBuffer = await fileBlob.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     await writeFileAsync(wavPath, buffer);
+    console.log(`Audio file downloaded to: ${wavPath}`);
     
-    // Convert WAV to MP3
+    // Update progress
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_progress: 'Downloading audio file completed'
+      }
+    );
+    
+    // Step 2: Convert WAV to MP3
+    console.log('Starting WAV to MP3 conversion');
     await new Promise((resolve, reject) => {
       ffmpeg(wavPath)
         .audioCodec('libmp3lame')
         .audioBitrate('192k')
         .format('mp3')
+        .on('progress', (progress) => {
+          console.log(`MP3 Conversion: ${JSON.stringify(progress)}`);
+        })
         .on('error', reject)
         .on('end', resolve)
         .save(mp3Path);
     });
+    console.log(`MP3 conversion completed: ${mp3Path}`);
     
-    // Upload MP3 to Appwrite
+    // Update progress
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_progress: 'MP3 conversion completed'
+      }
+    );
+    
+    // Step 3: Upload MP3 to Appwrite
+    console.log('Uploading MP3 to storage');
     const mp3Buffer = await readFileAsync(mp3Path);
     const mp3File = await storage.createFile(
       APPWRITE_BUCKET_ID,
@@ -100,8 +179,21 @@ module.exports = async function(req, res) {
       mp3Buffer,
       `${baseName}.mp3`
     );
+    console.log(`MP3 file uploaded with ID: ${mp3File.$id}`);
     
-    // Create HLS segments
+    // Update progress
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_progress: 'MP3 upload completed',
+        mp3_url: `${APPWRITE_ENDPOINT}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${mp3File.$id}/view?project=${APPWRITE_FUNCTION_PROJECT_ID}`
+      }
+    );
+    
+    // Step 4: Create HLS segments
+    console.log('Creating HLS segments');
     const segmentsDir = path.join(tempDir, 'segments');
     await mkdirAsync(segmentsDir, { recursive: true });
     
@@ -119,12 +211,27 @@ module.exports = async function(req, res) {
           '-hls_segment_type mpegts',
           '-hls_segment_filename', segmentsPattern
         ])
+        .on('progress', (progress) => {
+          console.log(`HLS Segmentation: ${JSON.stringify(progress)}`);
+        })
         .on('error', reject)
         .on('end', resolve)
         .save(playlistPath);
     });
+    console.log('HLS segmentation completed');
     
-    // Upload segments and collect IDs
+    // Update progress
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_progress: 'HLS segmentation completed'
+      }
+    );
+    
+    // Step 5: Upload segments and collect IDs
+    console.log('Uploading HLS segments');
     const segmentFiles = fs.readdirSync(segmentsDir);
     const segmentFileIds = {};
     const streamingUrls = [];
@@ -147,8 +254,20 @@ module.exports = async function(req, res) {
         streamingUrls.push(streamingUrl);
       }
     }
+    console.log(`Uploaded ${Object.keys(segmentFileIds).length} HLS segments`);
     
-    // Create and upload modified playlist
+    // Update progress
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_progress: 'HLS segments uploaded'
+      }
+    );
+    
+    // Step 6: Create and upload modified playlist
+    console.log('Creating and uploading modified playlist');
     const playlistContent = await readFileAsync(playlistPath, 'utf8');
     let newPlaylistContent = playlistContent;
     
@@ -170,8 +289,10 @@ module.exports = async function(req, res) {
       playlistBuffer,
       `${baseName}.m3u8`
     );
+    console.log(`Playlist uploaded with ID: ${playlist.$id}`);
     
-    // Update post with processed audio information
+    // Step 7: Update post with all processed audio information
+    console.log(`Updating post ${postId} with all processed information`);
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -180,11 +301,15 @@ module.exports = async function(req, res) {
         mp3_url: `${APPWRITE_ENDPOINT}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${mp3File.$id}/view?project=${APPWRITE_FUNCTION_PROJECT_ID}`,
         m3u8_url: `${APPWRITE_ENDPOINT}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${playlist.$id}/view?project=${APPWRITE_FUNCTION_PROJECT_ID}`,
         segments: JSON.stringify(Object.values(segmentFileIds)),
-        streaming_urls: streamingUrls
+        streaming_urls: streamingUrls,
+        processing_status: 'completed',
+        processing_completed_at: new Date().toISOString(),
+        processing_progress: 'All processing completed'
       }
     );
     
     // Clean up
+    console.log('Cleaning up temporary files');
     await unlinkAsync(wavPath);
     await unlinkAsync(mp3Path);
     await unlinkAsync(newPlaylistPath);
@@ -193,15 +318,36 @@ module.exports = async function(req, res) {
       await unlinkAsync(path.join(segmentsDir, file));
     }
     
+    console.log(`Audio processing for post ${postId} completed successfully`);
     return res.json({
       success: true,
       message: 'Successfully processed audio',
+      postId: postId,
       mp3Id: mp3File.$id,
       playlistId: playlist.$id,
-      segmentIds: Object.values(segmentFileIds)
+      segmentCount: Object.values(segmentFileIds).length
     });
   } catch (error) {
     console.error('Error processing audio:', error);
+    
+    // Try to update the post with error information if we have a postId
+    try {
+      if (payload && payload.postId) {
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          payload.postId,
+          {
+            processing_status: 'failed',
+            processing_error: error.message,
+            processing_completed_at: new Date().toISOString()
+          }
+        );
+        console.log(`Updated post ${payload.postId} with error status`);
+      }
+    } catch (updateError) {
+      console.error('Failed to update post with error status:', updateError);
+    }
     
     return res.json({
       success: false,
