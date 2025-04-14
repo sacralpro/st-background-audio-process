@@ -1,6 +1,5 @@
 require('dotenv').config();
-const { processPost } = require('../src/processor');
-const { getDatabases, Query } = require('node-appwrite');
+const axios = require('axios');
 
 exports.handler = async function (event, context) {
   // Ensure we're receiving a POST request
@@ -40,23 +39,40 @@ exports.handler = async function (event, context) {
       };
     }
     
-    // Get the document details
+    // Get the document ID
     const documentId = payload.payload.$id;
     
-    // Connect to Appwrite and get the full document
-    const databases = getDatabases();
-    const document = await databases.getDocument(
-      process.env.APPWRITE_DATABASE_ID,
-      process.env.APPWRITE_COLLECTION_ID_POST,
-      documentId
-    );
+    // Configuration
+    const {
+      APPWRITE_ENDPOINT,
+      APPWRITE_PROJECT_ID,
+      APPWRITE_API_KEY,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      APPWRITE_FUNCTION_ID
+    } = process.env;
+    
+    // Setup Appwrite API headers
+    const headers = {
+      'Content-Type': 'application/json',
+      'X-Appwrite-Project': APPWRITE_PROJECT_ID,
+      'X-Appwrite-Key': APPWRITE_API_KEY
+    };
+    
+    // Get the document to check if it needs processing
+    const documentUrl = `${APPWRITE_ENDPOINT}/databases/${APPWRITE_DATABASE_ID}/collections/${APPWRITE_COLLECTION_ID_POST}/documents/${documentId}`;
+    const documentResponse = await axios.get(documentUrl, { headers });
+    const document = documentResponse.data;
     
     // Check if this post has an unprocessed WAV file
     if (document.audio_url && !document.mp3_url) {
       console.log(`Processing new post from webhook: ${documentId}`);
       
-      // Process the post
-      await processPost(document);
+      // Call Appwrite function to process this post
+      const executionUrl = `${APPWRITE_ENDPOINT}/functions/${APPWRITE_FUNCTION_ID}/executions`;
+      const functionPayload = { postId: documentId };
+      
+      await axios.post(executionUrl, functionPayload, { headers });
       
       return {
         statusCode: 200,
