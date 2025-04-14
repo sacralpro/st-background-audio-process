@@ -6,9 +6,8 @@
 [functions]
   directory = "functions-build"
 
-# Define scheduled function with cron schedule
-[functions.scheduled-processor]
-  schedule = "*/15 * * * *"
+# Scheduled function removed - audio processing is now triggered directly from Sacral Track app
+# Old schedule was: "*/15 * * * *" (every 15 minutes)
 
 # No special configuration needed for webhook function
 # It is automatically included based on the file name
