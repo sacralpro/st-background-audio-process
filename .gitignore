@@ -1,0 +1,29 @@
+# Environment variables
+.env
+.env.local
+.env.development
+.env.production
+
+# Dependencies
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build files
+build/
+dist/
+.netlify/
+functions-build/
+
+# Temporary files
+tmp/
+temp/
+*.mp3
+*.wav
+*.ts
+*.m3u8
+
+# System files
+.DS_Store
+Thumbs.db 

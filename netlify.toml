@@ -1,0 +1,18 @@
+[build]
+  command = "npm run build"
+  functions = "functions-build"
+  publish = "public"
+
+# Scheduled function that runs every 15 minutes
+[[functions]]
+  name = "scheduled-processor"
+  schedule = "*/15 * * * *"
+  path = "functions/scheduled-processor"
+
+# Webhook function for real-time processing
+[[functions]]
+  name = "webhook-processor"
+  path = "functions/webhook-processor"
+
+[dev]
+  autoLaunch = false 

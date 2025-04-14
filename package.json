@@ -1,0 +1,26 @@
+{
+  "name": "st-background-audio-process",
+  "version": "1.0.0",
+  "description": "Background audio processor for Sacral Track",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "build": "netlify-lambda build functions"
+  },
+  "dependencies": {
+    "node-appwrite": "^9.0.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "axios": "^1.4.0",
+    "dotenv": "^16.3.1",
+    "node-fetch": "^3.3.1",
+    "@netlify/functions": "^1.6.0",
+    "netlify-lambda": "^2.0.16"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+} 
