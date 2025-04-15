@@ -24,7 +24,7 @@ module.exports = async function(context) {
     APPWRITE_COLLECTION_ID_POST,
     APPWRITE_BUCKET_ID,
     APPWRITE_ENDPOINT 
-  } = context.env;
+  } = process.env;
   
   // Connect to Appwrite
   client
