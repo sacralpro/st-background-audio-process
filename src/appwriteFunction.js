@@ -13,6 +13,16 @@ const mkdirAsync = promisify(fs.mkdir);
 
 // Main entry point for Appwrite Function
 module.exports = async function(req, res) {
+  // Check if this is being called in standard Appwrite Functions manner with single context parameter
+  if (req && !res && req.req && req.res) {
+    // This looks like it's being called with a single context object as first parameter
+    // Adjust our variables to match expected pattern
+    const context = req; // First parameter is actually the context
+    req = context.req;
+    res = context.res;
+    console.log('[APPWRITE_FUNCTION] Detected Appwrite context object, adapting parameters');
+  }
+
   // Early check for raw req/res objects to prevent errors
   if (!req || !res) {
     console.log('[APPWRITE_FUNCTION] Warning: req or res is undefined');
@@ -35,6 +45,13 @@ module.exports = async function(req, res) {
     }
   };
   
+  // Additional diagnostic information
+  context.log('Function environment:');
+  context.log('- Node version:', process.version);
+  context.log('- Environment variables present:', Object.keys(process.env).join(', '));
+  context.log('- Appwrite Function ID:', process.env.APPWRITE_FUNCTION_ID || 'Not set');
+  context.log('- Appwrite Runtime:', process.env.APPWRITE_RUNTIME || 'Not set');
+
   // Ensure res has json method
   if (!context.res.json) {
     context.res.json = function(data) {
@@ -583,4 +600,18 @@ module.exports = async function(req, res) {
       error: error.message
     });
   }
+};
+
+// Alternate export format for Appwrite Functions compatibility
+// This ensures that if Appwrite calls our function with a single context object,
+// it will still work correctly
+exports.handler = async (context) => {
+  if (!context) {
+    console.log('[APPWRITE_FUNCTION] Warning: context is undefined in handler');
+    context = { req: {}, res: { json: (data) => data } };
+  }
+  
+  console.log('[APPWRITE_FUNCTION] Function called via handler method');
+  // Call our main implementation with the context object
+  return await module.exports(context);
 }; 
