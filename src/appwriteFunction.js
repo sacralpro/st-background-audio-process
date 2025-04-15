@@ -35,17 +35,35 @@ module.exports = async function(context) {
   const databases = new sdk.Databases(client);
   const storage = new sdk.Storage(client);
   
+  // Извлекаем payload здесь, чтобы он был доступен и в блоке catch
+  let payload = {};
   try {
-    context.log('Starting audio processing function...');
+    if (context && context.req && context.req.body) {
+      // Проверяем, является ли тело запроса строкой
+      if (typeof context.req.body === 'string') {
+        try {
+          payload = JSON.parse(context.req.body);
+        } catch (parseError) {
+          console.error('Error parsing request body:', parseError);
+          return context.res.json({
+            success: false,
+            message: 'Invalid JSON in request body'
+          });
+        }
+      } else {
+        payload = context.req.body;
+      }
+    }
     
-    const payload = context.req.body || {};
+    console.log('Starting audio processing function...');
+    
     let postId = payload.postId || null;
     
     if (!postId && payload.event && payload.payload && payload.payload.$id) {
       if (payload.event.includes('documents') && 
           (payload.event.includes('create') || payload.event.includes('update'))) {
         postId = payload.payload.$id;
-        context.log(`Event trigger for post: ${postId} via ${payload.event}`);
+        console.log(`Event trigger for post: ${postId} via ${payload.event}`);
       } else {
         return context.res.json({
           success: false,
@@ -61,7 +79,7 @@ module.exports = async function(context) {
       });
     }
     
-    context.log(`Fetching post document: ${postId}`);
+    console.log(`Fetching post document: ${postId}`);
     const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -69,7 +87,7 @@ module.exports = async function(context) {
     );
     
     if (!post.audio_url) {
-      context.log(`Post ${postId} has no audio file to process`);
+      console.log(`Post ${postId} has no audio file to process`);
       return context.res.json({
         success: false,
         message: 'Post has no audio file to process'
@@ -77,7 +95,7 @@ module.exports = async function(context) {
     }
     
     if (post.mp3_url) {
-      context.log(`Post ${postId} is already processed`);
+      console.log(`Post ${postId} is already processed`);
       return context.res.json({
         success: true,
         message: 'Post already processed',
@@ -86,7 +104,7 @@ module.exports = async function(context) {
       });
     }
     
-    context.log(`Updating post ${postId} status to processing`);
+    console.log(`Updating post ${postId} status to processing`);
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -103,9 +121,9 @@ module.exports = async function(context) {
     
     // Extract file ID from audio_url
     const audioUrl = post.audio_url;
-    context.log(`Original audio URL: ${audioUrl}`);
+    console.log(`Original audio URL: ${audioUrl}`);
     const wavFileId = audioUrl.split('/files/')[1].split('/')[0];
-    context.log(`Extracted file ID: ${wavFileId}`);
+    console.log(`Extracted file ID: ${wavFileId}`);
     
     // Create base name for files
     const baseName = `track_${post.$id}`;
@@ -113,12 +131,12 @@ module.exports = async function(context) {
     const mp3Path = path.join(tempDir, `${baseName}.mp3`);
     
     // Step 1: Download WAV file
-    context.log(`Downloading audio file: ${wavFileId}`);
+    console.log(`Downloading audio file: ${wavFileId}`);
     const fileBlob = await storage.getFileDownload(APPWRITE_BUCKET_ID, wavFileId);
     const arrayBuffer = await fileBlob.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     await writeFileAsync(wavPath, buffer);
-    context.log(`Audio file downloaded to: ${wavPath}`);
+    console.log(`Audio file downloaded to: ${wavPath}`);
     
     // Update progress
     await databases.updateDocument(
@@ -131,20 +149,20 @@ module.exports = async function(context) {
     );
     
     // Step 2: Convert WAV to MP3
-    context.log('Starting WAV to MP3 conversion');
+    console.log('Starting WAV to MP3 conversion');
     await new Promise((resolve, reject) => {
       ffmpeg(wavPath)
         .audioCodec('libmp3lame')
         .audioBitrate('192k')
         .format('mp3')
         .on('progress', (progress) => {
-          context.log(`MP3 Conversion: ${JSON.stringify(progress)}`);
+          console.log(`MP3 Conversion: ${JSON.stringify(progress)}`);
         })
         .on('error', reject)
         .on('end', resolve)
         .save(mp3Path);
     });
-    context.log(`MP3 conversion completed: ${mp3Path}`);
+    console.log(`MP3 conversion completed: ${mp3Path}`);
     
     // Update progress
     await databases.updateDocument(
@@ -157,7 +175,7 @@ module.exports = async function(context) {
     );
     
     // Step 3: Upload MP3 to Appwrite
-    context.log('Uploading MP3 to storage');
+    console.log('Uploading MP3 to storage');
     const mp3Buffer = await readFileAsync(mp3Path);
     const mp3File = await storage.createFile(
       APPWRITE_BUCKET_ID,
@@ -165,7 +183,7 @@ module.exports = async function(context) {
       mp3Buffer,
       `${baseName}.mp3`
     );
-    context.log(`MP3 file uploaded with ID: ${mp3File.$id}`);
+    console.log(`MP3 file uploaded with ID: ${mp3File.$id}`);
     
     // Update progress
     await databases.updateDocument(
@@ -179,7 +197,7 @@ module.exports = async function(context) {
     );
     
     // Step 4: Create HLS segments
-    context.log('Creating HLS segments');
+    console.log('Creating HLS segments');
     const segmentsDir = path.join(tempDir, 'segments');
     await mkdirAsync(segmentsDir, { recursive: true });
     
@@ -198,13 +216,13 @@ module.exports = async function(context) {
           '-hls_segment_filename', segmentsPattern
         ])
         .on('progress', (progress) => {
-          context.log(`HLS Segmentation: ${JSON.stringify(progress)}`);
+          console.log(`HLS Segmentation: ${JSON.stringify(progress)}`);
         })
         .on('error', reject)
         .on('end', resolve)
         .save(playlistPath);
     });
-    context.log('HLS segmentation completed');
+    console.log('HLS segmentation completed');
     
     // Update progress
     await databases.updateDocument(
@@ -217,7 +235,7 @@ module.exports = async function(context) {
     );
     
     // Step 5: Upload segments and collect IDs
-    context.log('Uploading HLS segments');
+    console.log('Uploading HLS segments');
     const segmentFiles = fs.readdirSync(segmentsDir);
     const segmentFileIds = {};
     const streamingUrls = [];
@@ -240,7 +258,7 @@ module.exports = async function(context) {
         streamingUrls.push(streamingUrl);
       }
     }
-    context.log(`Uploaded ${Object.keys(segmentFileIds).length} HLS segments`);
+    console.log(`Uploaded ${Object.keys(segmentFileIds).length} HLS segments`);
     
     // Update progress
     await databases.updateDocument(
@@ -253,7 +271,7 @@ module.exports = async function(context) {
     );
     
     // Step 6: Create and upload modified playlist
-    context.log('Creating and uploading modified playlist');
+    console.log('Creating and uploading modified playlist');
     const playlistContent = await readFileAsync(playlistPath, 'utf8');
     let newPlaylistContent = playlistContent;
     
@@ -275,10 +293,10 @@ module.exports = async function(context) {
       playlistBuffer,
       `${baseName}.m3u8`
     );
-    context.log(`Playlist uploaded with ID: ${playlist.$id}`);
+    console.log(`Playlist uploaded with ID: ${playlist.$id}`);
     
     // Step 7: Update post with all processed audio information
-    context.log(`Updating post ${postId} with all processed information`);
+    console.log(`Updating post ${postId} with all processed information`);
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -295,7 +313,7 @@ module.exports = async function(context) {
     );
     
     // Clean up
-    context.log('Cleaning up temporary files');
+    console.log('Cleaning up temporary files');
     await unlinkAsync(wavPath);
     await unlinkAsync(mp3Path);
     await unlinkAsync(newPlaylistPath);
@@ -304,7 +322,7 @@ module.exports = async function(context) {
       await unlinkAsync(path.join(segmentsDir, file));
     }
     
-    context.log(`Audio processing for post ${postId} completed successfully`);
+    console.log(`Audio processing for post ${postId} completed successfully`);
     return context.res.json({
       success: true,
       message: 'Successfully processed audio',
@@ -314,7 +332,7 @@ module.exports = async function(context) {
       segmentCount: Object.values(segmentFileIds).length
     });
   } catch (error) {
-    context.error('Error processing audio:', error);
+    console.error('Error processing audio:', error);
     
     try {
       if (payload && payload.postId) {
@@ -328,10 +346,10 @@ module.exports = async function(context) {
             processing_completed_at: new Date().toISOString()
           }
         );
-        context.log(`Updated post ${payload.postId} with error status`);
+        console.log(`Updated post ${payload.postId} with error status`);
       }
     } catch (updateError) {
-      context.error('Failed to update post with error status:', updateError);
+      console.error('Failed to update post with error status:', updateError);
     }
     
     return context.res.json({
