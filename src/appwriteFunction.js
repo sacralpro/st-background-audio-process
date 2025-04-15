@@ -13,6 +13,16 @@ const mkdirAsync = promisify(fs.mkdir);
 
 // Main entry point for Appwrite Function
 module.exports = async function(req, res) {
+  // Early check for raw req/res objects to prevent errors
+  if (!req || !res) {
+    console.log('[APPWRITE_FUNCTION] Warning: req or res is undefined');
+    // Create minimal objects to prevent errors
+    req = req || {};
+    res = res || {
+      json: function(data) { return data; }
+    };
+  }
+
   // Check if context exists (for Appwrite Function environment)
   const context = { 
     req: req || {}, 
@@ -30,6 +40,16 @@ module.exports = async function(req, res) {
     context.res.json = function(data) {
       return data;
     };
+  }
+  
+  // Dump request info for debugging
+  context.log('Request details:');
+  if (context.req) {
+    context.log('- Method:', context.req.method || 'unknown');
+    context.log('- URL:', context.req.url || 'unknown');
+    if (context.req.headers) {
+      context.log('- Content-Type:', context.req.headers['content-type'] || 'none');
+    }
   }
 
   // Set up Appwrite SDK
@@ -76,29 +96,82 @@ module.exports = async function(req, res) {
       context.log(`Received ${context.req.method} request`);
     }
     
-    // Parse request body if it's a string
-    if (context.req && context.req.body) {
-      if (typeof context.req.body === 'string') {
-        try {
-          // Ensure the string is clean before parsing
-          const trimmedBody = context.req.body.trim();
-          context.log('Request body string length:', trimmedBody.length);
-          
-          // For debugging, log the first 100 characters
-          if (trimmedBody.length > 0) {
-            context.log('First 100 chars of body:', trimmedBody.substring(0, 100));
+    // Handle potential errors with request body due to invalid content-type
+    if (context.req) {
+      try {
+        // Parse request body if it's a string
+        if (context.req.body !== undefined) {
+          if (typeof context.req.body === 'string') {
+            try {
+              // Ensure the string is clean before parsing
+              const trimmedBody = context.req.body.trim();
+              context.log('Request body string length:', trimmedBody.length);
+              
+              // For debugging, log the first 100 characters
+              if (trimmedBody.length > 0) {
+                context.log('First 100 chars of body:', trimmedBody.substring(0, 100));
+                
+                // Try to parse as JSON
+                payload = JSON.parse(trimmedBody);
+              }
+            } catch (parseError) {
+              context.error('Error parsing request body:', parseError.message);
+              // Try to use the raw body as a fallback
+              context.log('Trying to use raw body as fallback');
+              payload = { postId: context.req.body.trim() };
+            }
+          } else if (typeof context.req.body === 'object') {
+            payload = context.req.body;
+            context.log('Received request body as object');
           }
-          
-          payload = JSON.parse(trimmedBody);
-        } catch (parseError) {
-          context.error('Error parsing request body:', parseError.message);
-          // Try to use the raw body as a fallback
-          context.log('Trying to use raw body as fallback');
-          payload = { postId: context.req.body.trim() };
+        } else if (context.req.rawBody) {
+          // If standard body parsing failed, try the rawBody if available
+          context.log('Using rawBody as fallback');
+          try {
+            const rawBody = typeof context.req.rawBody === 'string' 
+              ? context.req.rawBody 
+              : context.req.rawBody.toString();
+            
+            const trimmedRawBody = rawBody.trim();
+            context.log('Raw body length:', trimmedRawBody.length);
+            
+            if (trimmedRawBody.length > 0) {
+              try {
+                payload = JSON.parse(trimmedRawBody);
+              } catch (parseError) {
+                context.log('Raw body is not JSON, using as postId');
+                payload = { postId: trimmedRawBody };
+              }
+            }
+          } catch (rawError) {
+            context.error('Error processing raw body:', rawError.message);
+          }
+        } else if (context.req.bodyRaw) {
+          // Another fallback for raw body
+          context.log('Using bodyRaw as fallback');
+          try {
+            const bodyRaw = typeof context.req.bodyRaw === 'string'
+              ? context.req.bodyRaw
+              : Buffer.isBuffer(context.req.bodyRaw)
+                ? context.req.bodyRaw.toString()
+                : JSON.stringify(context.req.bodyRaw);
+            
+            const trimmedBodyRaw = bodyRaw.trim();
+            
+            if (trimmedBodyRaw.length > 0) {
+              try {
+                payload = JSON.parse(trimmedBodyRaw);
+              } catch (parseError) {
+                context.log('bodyRaw is not JSON, using as postId');
+                payload = { postId: trimmedBodyRaw };
+              }
+            }
+          } catch (rawError) {
+            context.error('Error processing bodyRaw:', rawError.message);
+          }
         }
-      } else if (typeof context.req.body === 'object') {
-        payload = context.req.body;
-        context.log('Received request body as object');
+      } catch (bodyError) {
+        context.error('Unexpected error processing request body:', bodyError.message);
       }
     } else if (context.req && context.req.headers && context.req.headers['x-appwrite-trigger']) {
       // This might be a webhook or scheduled event from Appwrite
