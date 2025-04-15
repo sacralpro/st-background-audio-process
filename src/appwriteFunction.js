@@ -7,8 +7,80 @@ import * as path from 'path';
 import { promisify } from 'util';
 import ffmpeg from 'fluent-ffmpeg';
 
+// Защита от ошибок парсинга JSON на самом раннем уровне
+// Monkey patch JSON.parse чтобы предотвратить сбои
+const originalJSONParse = JSON.parse;
+JSON.parse = function safeParse(text, reviver) {
+  if (typeof text !== 'string') {
+    return originalJSONParse(text, reviver);
+  }
+  
+  try {
+    // Clean the input string of common problems
+    let cleanedText = text
+      .replace(/^\uFEFF/, '')                  // BOM
+      .replace(/^\s+|\s+$/g, '')               // Leading/trailing whitespace
+      .replace(/\u200B/g, '')                  // Zero-width space
+      .replace(/\t/g, ' ')                     // Replace tabs with spaces
+      .replace(/\r?\n/g, '');                  // Remove all newlines
+    
+    // Find valid JSON in malformed string
+    const firstBrace = cleanedText.indexOf('{');
+    const lastBrace = cleanedText.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      cleanedText = cleanedText.substring(firstBrace, lastBrace + 1);
+    }
+    
+    // Try to parse with original parser
+    return originalJSONParse(cleanedText, reviver);
+  } catch (e) {
+    console.error('[APPWRITE_FUNCTION] JSON parse error intercepted:', e.message);
+    // Return a safe default object instead of crashing
+    return {};
+  }
+};
+
 // Main entry point for Appwrite Function - Single context parameter format
 export default async function(context) {
+  // Ensure context exists and set safe defaults
+  if (!context) {
+    context = { req: {}, res: { json: (data) => data } };
+  }
+  
+  // Safe wrapper for req.bodyJson to intercept errors
+  if (context.req) {
+    try {
+      // Force define bodyJson getter that won't throw
+      Object.defineProperty(context.req, 'bodyJson', {
+        get: function() {
+          try {
+            // If body is a string, try to parse it
+            if (typeof this.body === 'string') {
+              try {
+                return JSON.parse(this.body); // This will use our safe JSON.parse
+              } catch (e) {
+                console.log('[APPWRITE_FUNCTION] Safely caught bodyJson parse error');
+                return {}; // Return empty object instead of throwing
+              }
+            }
+            // If body is already an object, return it
+            if (typeof this.body === 'object' && this.body !== null) {
+              return this.body;
+            }
+            // Default
+            return {};
+          } catch (e) {
+            console.log('[APPWRITE_FUNCTION] Safely caught bodyJson access error');
+            return {}; // Return empty object instead of throwing
+          }
+        },
+        configurable: true
+      });
+    } catch (e) {
+      console.error('[APPWRITE_FUNCTION] Cannot redefine bodyJson property:', e.message);
+    }
+  }
+  
   // Start tracking execution time
   const startTime = Date.now();
   
