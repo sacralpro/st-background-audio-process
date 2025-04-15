@@ -14,7 +14,16 @@ const mkdirAsync = promisify(fs.mkdir);
 // Main entry point for Appwrite Function
 module.exports = async function(req, res) {
   // Check if context exists (for Appwrite Function environment)
-  const context = { req: req || {}, res: res || {} };
+  const context = { 
+    req: req || {}, 
+    res: res || {},
+    log: function(...args) {
+      console.log('[APPWRITE_FUNCTION]', ...args);
+    },
+    error: function(...args) {
+      console.error('[APPWRITE_FUNCTION_ERROR]', ...args);
+    }
+  };
   
   // Ensure res has json method
   if (!context.res.json) {
