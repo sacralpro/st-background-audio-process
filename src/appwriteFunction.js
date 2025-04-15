@@ -12,7 +12,7 @@ const unlinkAsync = promisify(fs.unlink);
 const mkdirAsync = promisify(fs.mkdir);
 
 // Main entry point for Appwrite Function
-module.exports = async function(req, res) {
+module.exports = async function(context) {
   // Initialize Appwrite SDK
   const client = new sdk.Client();
   
@@ -24,7 +24,7 @@ module.exports = async function(req, res) {
     APPWRITE_COLLECTION_ID_POST,
     APPWRITE_BUCKET_ID,
     APPWRITE_ENDPOINT 
-  } = process.env;
+  } = context.env;
   
   // Connect to Appwrite
   client
@@ -36,38 +36,32 @@ module.exports = async function(req, res) {
   const storage = new sdk.Storage(client);
   
   try {
-    console.log('Starting audio processing function...');
+    context.log('Starting audio processing function...');
     
-    const payload = req.body || {};
+    const payload = context.req.body || {};
     let postId = payload.postId || null;
     
     if (!postId && payload.event && payload.payload && payload.payload.$id) {
       if (payload.event.includes('documents') && 
           (payload.event.includes('create') || payload.event.includes('update'))) {
         postId = payload.payload.$id;
-        console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+        context.log(`Event trigger for post: ${postId} via ${payload.event}`);
       } else {
-        if (res) {
-          return res.json({
-            success: false,
-            message: 'Unsupported event type'
-          });
-        }
-        return res ? res.send() : undefined;
+        return context.res.json({
+          success: false,
+          message: 'Unsupported event type'
+        });
       }
     } 
     
     if (!postId) {
-      if (res) {
-        return res.json({
-          success: false,
-          message: 'Missing postId in payload'
-        });
-      }
-      return res ? res.send() : undefined;
+      return context.res.json({
+        success: false,
+        message: 'Missing postId in payload'
+      });
     }
     
-    console.log(`Fetching post document: ${postId}`);
+    context.log(`Fetching post document: ${postId}`);
     const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -75,30 +69,24 @@ module.exports = async function(req, res) {
     );
     
     if (!post.audio_url) {
-      console.log(`Post ${postId} has no audio file to process`);
-      if (res) {
-        return res.json({
-          success: false,
-          message: 'Post has no audio file to process'
-        });
-      }
-      return res ? res.send() : undefined;
+      context.log(`Post ${postId} has no audio file to process`);
+      return context.res.json({
+        success: false,
+        message: 'Post has no audio file to process'
+      });
     }
     
     if (post.mp3_url) {
-      console.log(`Post ${postId} is already processed`);
-      if (res) {
-        return res.json({
-          success: true,
-          message: 'Post already processed',
-          mp3_url: post.mp3_url,
-          m3u8_url: post.m3u8_url
-        });
-      }
-      return res ? res.send() : undefined;
+      context.log(`Post ${postId} is already processed`);
+      return context.res.json({
+        success: true,
+        message: 'Post already processed',
+        mp3_url: post.mp3_url,
+        m3u8_url: post.m3u8_url
+      });
     }
     
-    console.log(`Updating post ${postId} status to processing`);
+    context.log(`Updating post ${postId} status to processing`);
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -115,9 +103,9 @@ module.exports = async function(req, res) {
     
     // Extract file ID from audio_url
     const audioUrl = post.audio_url;
-    console.log(`Original audio URL: ${audioUrl}`);
+    context.log(`Original audio URL: ${audioUrl}`);
     const wavFileId = audioUrl.split('/files/')[1].split('/')[0];
-    console.log(`Extracted file ID: ${wavFileId}`);
+    context.log(`Extracted file ID: ${wavFileId}`);
     
     // Create base name for files
     const baseName = `track_${post.$id}`;
@@ -125,12 +113,12 @@ module.exports = async function(req, res) {
     const mp3Path = path.join(tempDir, `${baseName}.mp3`);
     
     // Step 1: Download WAV file
-    console.log(`Downloading audio file: ${wavFileId}`);
+    context.log(`Downloading audio file: ${wavFileId}`);
     const fileBlob = await storage.getFileDownload(APPWRITE_BUCKET_ID, wavFileId);
     const arrayBuffer = await fileBlob.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
     await writeFileAsync(wavPath, buffer);
-    console.log(`Audio file downloaded to: ${wavPath}`);
+    context.log(`Audio file downloaded to: ${wavPath}`);
     
     // Update progress
     await databases.updateDocument(
@@ -143,20 +131,20 @@ module.exports = async function(req, res) {
     );
     
     // Step 2: Convert WAV to MP3
-    console.log('Starting WAV to MP3 conversion');
+    context.log('Starting WAV to MP3 conversion');
     await new Promise((resolve, reject) => {
       ffmpeg(wavPath)
         .audioCodec('libmp3lame')
         .audioBitrate('192k')
         .format('mp3')
         .on('progress', (progress) => {
-          console.log(`MP3 Conversion: ${JSON.stringify(progress)}`);
+          context.log(`MP3 Conversion: ${JSON.stringify(progress)}`);
         })
         .on('error', reject)
         .on('end', resolve)
         .save(mp3Path);
     });
-    console.log(`MP3 conversion completed: ${mp3Path}`);
+    context.log(`MP3 conversion completed: ${mp3Path}`);
     
     // Update progress
     await databases.updateDocument(
@@ -169,7 +157,7 @@ module.exports = async function(req, res) {
     );
     
     // Step 3: Upload MP3 to Appwrite
-    console.log('Uploading MP3 to storage');
+    context.log('Uploading MP3 to storage');
     const mp3Buffer = await readFileAsync(mp3Path);
     const mp3File = await storage.createFile(
       APPWRITE_BUCKET_ID,
@@ -177,7 +165,7 @@ module.exports = async function(req, res) {
       mp3Buffer,
       `${baseName}.mp3`
     );
-    console.log(`MP3 file uploaded with ID: ${mp3File.$id}`);
+    context.log(`MP3 file uploaded with ID: ${mp3File.$id}`);
     
     // Update progress
     await databases.updateDocument(
@@ -191,7 +179,7 @@ module.exports = async function(req, res) {
     );
     
     // Step 4: Create HLS segments
-    console.log('Creating HLS segments');
+    context.log('Creating HLS segments');
     const segmentsDir = path.join(tempDir, 'segments');
     await mkdirAsync(segmentsDir, { recursive: true });
     
@@ -210,13 +198,13 @@ module.exports = async function(req, res) {
           '-hls_segment_filename', segmentsPattern
         ])
         .on('progress', (progress) => {
-          console.log(`HLS Segmentation: ${JSON.stringify(progress)}`);
+          context.log(`HLS Segmentation: ${JSON.stringify(progress)}`);
         })
         .on('error', reject)
         .on('end', resolve)
         .save(playlistPath);
     });
-    console.log('HLS segmentation completed');
+    context.log('HLS segmentation completed');
     
     // Update progress
     await databases.updateDocument(
@@ -229,7 +217,7 @@ module.exports = async function(req, res) {
     );
     
     // Step 5: Upload segments and collect IDs
-    console.log('Uploading HLS segments');
+    context.log('Uploading HLS segments');
     const segmentFiles = fs.readdirSync(segmentsDir);
     const segmentFileIds = {};
     const streamingUrls = [];
@@ -252,7 +240,7 @@ module.exports = async function(req, res) {
         streamingUrls.push(streamingUrl);
       }
     }
-    console.log(`Uploaded ${Object.keys(segmentFileIds).length} HLS segments`);
+    context.log(`Uploaded ${Object.keys(segmentFileIds).length} HLS segments`);
     
     // Update progress
     await databases.updateDocument(
@@ -265,7 +253,7 @@ module.exports = async function(req, res) {
     );
     
     // Step 6: Create and upload modified playlist
-    console.log('Creating and uploading modified playlist');
+    context.log('Creating and uploading modified playlist');
     const playlistContent = await readFileAsync(playlistPath, 'utf8');
     let newPlaylistContent = playlistContent;
     
@@ -287,10 +275,10 @@ module.exports = async function(req, res) {
       playlistBuffer,
       `${baseName}.m3u8`
     );
-    console.log(`Playlist uploaded with ID: ${playlist.$id}`);
+    context.log(`Playlist uploaded with ID: ${playlist.$id}`);
     
     // Step 7: Update post with all processed audio information
-    console.log(`Updating post ${postId} with all processed information`);
+    context.log(`Updating post ${postId} with all processed information`);
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -307,7 +295,7 @@ module.exports = async function(req, res) {
     );
     
     // Clean up
-    console.log('Cleaning up temporary files');
+    context.log('Cleaning up temporary files');
     await unlinkAsync(wavPath);
     await unlinkAsync(mp3Path);
     await unlinkAsync(newPlaylistPath);
@@ -316,20 +304,17 @@ module.exports = async function(req, res) {
       await unlinkAsync(path.join(segmentsDir, file));
     }
     
-    console.log(`Audio processing for post ${postId} completed successfully`);
-    if (res) {
-      return res.json({
-        success: true,
-        message: 'Successfully processed audio',
-        postId: postId,
-        mp3Id: mp3File.$id,
-        playlistId: playlist.$id,
-        segmentCount: Object.values(segmentFileIds).length
-      });
-    }
-    return res ? res.send() : undefined;
+    context.log(`Audio processing for post ${postId} completed successfully`);
+    return context.res.json({
+      success: true,
+      message: 'Successfully processed audio',
+      postId: postId,
+      mp3Id: mp3File.$id,
+      playlistId: playlist.$id,
+      segmentCount: Object.values(segmentFileIds).length
+    });
   } catch (error) {
-    console.error('Error processing audio:', error);
+    context.error('Error processing audio:', error);
     
     try {
       if (payload && payload.postId) {
@@ -343,19 +328,16 @@ module.exports = async function(req, res) {
             processing_completed_at: new Date().toISOString()
           }
         );
-        console.log(`Updated post ${payload.postId} with error status`);
+        context.log(`Updated post ${payload.postId} with error status`);
       }
     } catch (updateError) {
-      console.error('Failed to update post with error status:', updateError);
+      context.error('Failed to update post with error status:', updateError);
     }
     
-    if (res) {
-      return res.json({
-        success: false,
-        message: 'Error processing audio',
-        error: error.message
-      });
-    }
-    return res ? res.send() : undefined;
+    return context.res.json({
+      success: false,
+      message: 'Error processing audio',
+      error: error.message
+    });
   }
 }; 
