@@ -29,6 +29,56 @@ export default async function(context) {
   
   // Safely extract functions from context with fallbacks
   const req = context.req || {};
+  
+  // Pre-process req.body early to prevent JSON parsing errors later
+  if (req.body !== undefined && typeof req.body === 'string') {
+    try {
+      // First, sanitize the string body
+      const sanitizedBody = req.body
+        .replace(/^\uFEFF/, '')                  // BOM
+        .replace(/^\s+|\s+$/g, '')               // Leading/trailing whitespace
+        .replace(/\u200B/g, '')                  // Zero-width space
+        .replace(/\t/g, ' ')                     // Replace tabs with spaces
+        .replace(/\r?\n/g, '')                   // Remove all newlines
+        .replace(/[\x00-\x1F\x7F-\x9F]/g, '');   // Control characters
+      
+      // Find valid JSON object or array in the string
+      let jsonContent = sanitizedBody;
+      const firstBrace = sanitizedBody.indexOf('{');
+      const lastBrace = sanitizedBody.lastIndexOf('}');
+      const firstBracket = sanitizedBody.indexOf('[');
+      const lastBracket = sanitizedBody.lastIndexOf(']');
+      
+      // Extract JSON if possible
+      if (firstBrace >= 0 && lastBrace > firstBrace) {
+        jsonContent = sanitizedBody.substring(firstBrace, lastBrace + 1);
+        console.log('[APPWRITE_FUNCTION] Extracted JSON object from body');
+      } else if (firstBracket >= 0 && lastBracket > firstBracket) {
+        jsonContent = sanitizedBody.substring(firstBracket, lastBracket + 1);
+        console.log('[APPWRITE_FUNCTION] Extracted JSON array from body');
+      }
+      
+      // Attempt to parse sanitized content
+      if ((jsonContent.startsWith('{') && jsonContent.endsWith('}')) || 
+          (jsonContent.startsWith('[') && jsonContent.endsWith(']'))) {
+        try {
+          // Create a pre-parsed body that will be used later
+          req.preParsedBody = JSON.parse(jsonContent);
+          console.log('[APPWRITE_FUNCTION] Successfully pre-parsed request body as JSON');
+        } catch (e) {
+          console.error('[APPWRITE_FUNCTION] Failed to pre-parse body as JSON:', e.message);
+          req.jsonParseError = e.message;
+          req.sanitizedBodyContent = jsonContent;
+        }
+      } else {
+        console.log('[APPWRITE_FUNCTION] Body is not a valid JSON structure');
+        req.sanitizedBodyContent = jsonContent;
+      }
+    } catch (e) {
+      console.error('[APPWRITE_FUNCTION] Error during req.body pre-processing:', e.message);
+    }
+  }
+  
   const res = {
     json: (data) => {
       if (context.res && typeof context.res.json === 'function') {
@@ -101,6 +151,29 @@ export default async function(context) {
   let payload = {};
   let postId = null;
   
+  // Special case handling for webhook events
+  if (req.headers && req.headers['x-appwrite-trigger'] === 'event') {
+    log('Detected webhook event trigger');
+    
+    // For webhook events, try to extract directly from headers
+    if (req.headers['x-appwrite-event'] && req.headers['x-appwrite-event'].includes('.create')) {
+      log('Webhook event type:', req.headers['x-appwrite-event']);
+      
+      // If this is a creation event, we can often extract the ID directly
+      const eventResourceParts = req.headers['x-appwrite-event'].split('.');
+      if (eventResourceParts.length >= 2) {
+        const resourceType = eventResourceParts[0]; // e.g. 'databases.documents'
+        log('Webhook resource type:', resourceType);
+      }
+    }
+    
+    // Try to extract ID from any webhook event
+    if (req.preParsedBody && req.preParsedBody.$id) {
+      postId = req.preParsedBody.$id;
+      log(`Extracted postId from webhook event body: ${postId}`);
+    }
+  }
+  
   try {
     // Parse request body and extract payload
     
@@ -124,91 +197,101 @@ export default async function(context) {
         }
       }
       
-      // Safe parse body
-      try {
-        // Explicitly log the raw body for debugging
-        if (typeof req.body === 'string') {
-          log('Raw body as string:', req.body);
-          
-          // Check for non-printable characters
-          const hasNonPrintable = /[\x00-\x1F\x7F-\x9F]/.test(req.body);
-          if (hasNonPrintable) {
-            log('WARNING: Non-printable characters detected in the body');
-            // Show hex representation for debugging
-            const hexBody = Array.from(req.body).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' ');
-            log('Body as hex (first 100 bytes):', hexBody.substring(0, 300));
-          }
-        } else {
-          log('Raw body type:', typeof req.body);
-        }
-        
-        if (typeof req.body === 'string') {
-          log('Body is string, length:', req.body.length);
-          if (req.body.trim().length > 0) {
-            try {
-              // Try to safely parse the JSON with more aggressive cleaning
-              // Strip BOM, whitespace, and other common problematic characters
-              let cleanedBody = req.body
-                .replace(/^\uFEFF/, '')                  // BOM
-                .replace(/^\s+|\s+$/g, '')               // Leading/trailing whitespace
-                .replace(/\u200B/g, '')                  // Zero-width space
-                .replace(/[\x00-\x1F\x7F-\x9F]/g, '');   // Control characters
+      // Safe parse body - use pre-parsed body if available
+      if (req.preParsedBody) {
+        payload = req.preParsedBody;
+        log('Using pre-parsed body payload');
+      } else {
+        try {
+          // Safe parse body
+          try {
+            // Explicitly log the raw body for debugging
+            if (typeof req.body === 'string') {
+              log('Raw body as string:', req.body);
               
-              // Find the first '{' and last '}' for JSON objects, or first '[' and last ']' for arrays
-              const firstBrace = cleanedBody.indexOf('{');
-              const lastBrace = cleanedBody.lastIndexOf('}');
-              const firstBracket = cleanedBody.indexOf('[');
-              const lastBracket = cleanedBody.lastIndexOf(']');
-              
-              // Determine if this looks like a JSON object or array
-              let jsonContent = cleanedBody;
-              
-              if (firstBrace >= 0 && lastBrace > firstBrace) {
-                // Extract just the JSON object
-                jsonContent = cleanedBody.substring(firstBrace, lastBrace + 1);
-                log('Extracted JSON object from content');
-              } else if (firstBracket >= 0 && lastBracket > firstBracket) {
-                // Extract just the JSON array
-                jsonContent = cleanedBody.substring(firstBracket, lastBracket + 1);
-                log('Extracted JSON array from content');
+              // Check for non-printable characters
+              const hasNonPrintable = /[\x00-\x1F\x7F-\x9F]/.test(req.body);
+              if (hasNonPrintable) {
+                log('WARNING: Non-printable characters detected in the body');
+                // Show hex representation for debugging
+                const hexBody = Array.from(req.body).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' ');
+                log('Body as hex (first 100 bytes):', hexBody.substring(0, 300));
               }
-              
-              // Check if the body is already a valid JSON string
-              if ((jsonContent.startsWith('{') && jsonContent.endsWith('}')) || 
-                  (jsonContent.startsWith('[') && jsonContent.endsWith(']'))) {
-                try {
-                  log('Attempting to parse cleaned JSON:', jsonContent.substring(0, 100) + (jsonContent.length > 100 ? '...' : ''));
-                  payload = JSON.parse(jsonContent);
-                  log('Parsed JSON payload successfully');
-                } catch (parseError) {
-                  logError('JSON parse error after cleaning:', parseError.message);
-                  // Try to extract postId directly if JSON parsing fails
-                  const postIdMatch = jsonContent.match(/"postId"\s*:\s*"([^"]+)"/);
-                  if (postIdMatch && postIdMatch[1]) {
-                    payload = { postId: postIdMatch[1] };
-                    log('Extracted postId from invalid JSON:', postIdMatch[1]);
-                  } else {
-                    payload = { postId: jsonContent };
-                    log('Using cleaned content as postId fallback');
-                  }
-                }
-              } else {
-                // If not a JSON object, use as raw postId
-                payload = { postId: cleanedBody };
-                log('Using cleaned body as postId (not a JSON object)');
-              }
-            } catch (parseError) {
-              logError('JSON parse error:', parseError.message);
-              payload = { postId: req.body.trim() };
-              log('Using raw body as postId fallback');
+            } else {
+              log('Raw body type:', typeof req.body);
             }
+            
+            if (typeof req.body === 'string') {
+              log('Body is string, length:', req.body.length);
+              if (req.body.trim().length > 0) {
+                try {
+                  // Try to safely parse the JSON with more aggressive cleaning
+                  // Strip BOM, whitespace, and other common problematic characters
+                  let cleanedBody = req.body
+                    .replace(/^\uFEFF/, '')                  // BOM
+                    .replace(/^\s+|\s+$/g, '')               // Leading/trailing whitespace
+                    .replace(/\u200B/g, '')                  // Zero-width space
+                    .replace(/[\x00-\x1F\x7F-\x9F]/g, '');   // Control characters
+                  
+                  // Find the first '{' and last '}' for JSON objects, or first '[' and last ']' for arrays
+                  const firstBrace = cleanedBody.indexOf('{');
+                  const lastBrace = cleanedBody.lastIndexOf('}');
+                  const firstBracket = cleanedBody.indexOf('[');
+                  const lastBracket = cleanedBody.lastIndexOf(']');
+                  
+                  // Determine if this looks like a JSON object or array
+                  let jsonContent = cleanedBody;
+                  
+                  if (firstBrace >= 0 && lastBrace > firstBrace) {
+                    // Extract just the JSON object
+                    jsonContent = cleanedBody.substring(firstBrace, lastBrace + 1);
+                    log('Extracted JSON object from content');
+                  } else if (firstBracket >= 0 && lastBracket > firstBracket) {
+                    // Extract just the JSON array
+                    jsonContent = cleanedBody.substring(firstBracket, lastBracket + 1);
+                    log('Extracted JSON array from content');
+                  }
+                  
+                  // Check if the body is already a valid JSON string
+                  if ((jsonContent.startsWith('{') && jsonContent.endsWith('}')) || 
+                      (jsonContent.startsWith('[') && jsonContent.endsWith(']'))) {
+                    try {
+                      log('Attempting to parse cleaned JSON:', jsonContent.substring(0, 100) + (jsonContent.length > 100 ? '...' : ''));
+                      payload = JSON.parse(jsonContent);
+                      log('Parsed JSON payload successfully');
+                    } catch (parseError) {
+                      logError('JSON parse error after cleaning:', parseError.message);
+                      // Try to extract postId directly if JSON parsing fails
+                      const postIdMatch = jsonContent.match(/"postId"\s*:\s*"([^"]+)"/);
+                      if (postIdMatch && postIdMatch[1]) {
+                        payload = { postId: postIdMatch[1] };
+                        log('Extracted postId from invalid JSON:', postIdMatch[1]);
+                      } else {
+                        payload = { postId: jsonContent };
+                        log('Using cleaned content as postId fallback');
+                      }
+                    }
+                  } else {
+                    // If not a JSON object, use as raw postId
+                    payload = { postId: cleanedBody };
+                    log('Using cleaned body as postId (not a JSON object)');
+                  }
+                } catch (parseError) {
+                  logError('JSON parse error:', parseError.message);
+                  payload = { postId: req.body.trim() };
+                  log('Using raw body as postId fallback');
+                }
+              }
+            } else if (typeof req.body === 'object') {
+              payload = req.body;
+              log('Body is already an object');
+            }
+          } catch (bodyError) {
+            logError('Error processing body:', bodyError);
           }
-        } else if (typeof req.body === 'object') {
-          payload = req.body;
-          log('Body is already an object');
+        } catch (bodyError) {
+          logError('Error processing body:', bodyError);
         }
-      } catch (bodyError) {
-        logError('Error processing body:', bodyError);
       }
     }
     
@@ -306,9 +389,20 @@ export default async function(context) {
         if (req.bodyJson) {
           log('Using req.bodyJson for event data');
           eventData = req.bodyJson;
+        } else if (req.preParsedBody) {
+          log('Using preParsedBody for event data');
+          eventData = req.preParsedBody;
         } else if (payload && typeof payload === 'object') {
           log('Using payload for event data');
           eventData = payload;
+        } else if (req.sanitizedBodyContent) {
+          // As a last resort, try finding ID using regex in sanitized content
+          log('Trying to extract ID using regex from sanitized content');
+          const idMatch = req.sanitizedBodyContent.match(/"\\?\$id\\?"\s*:\s*"([^"]+)"/);
+          if (idMatch && idMatch[1]) {
+            postId = idMatch[1];
+            log(`Extracted postId using regex: ${postId}`);
+          }
         }
         
         // Try to find document ID in multiple places
@@ -351,6 +445,24 @@ export default async function(context) {
         success: false,
         message: 'No postId found in request'
       });
+    }
+    
+    // Sanitize postId if it's a JSON-like string
+    if (typeof postId === 'string' && 
+        (postId.startsWith('{') || postId.startsWith('['))) {
+      log('Warning: postId appears to be a JSON string, sanitizing...');
+      
+      // Create a simplified ID by hashing or using a part of the string
+      const sanitizedId = postId
+        .replace(/[{}\[\]"'\\]/g, '')   // Remove JSON chars
+        .replace(/\s+/g, '')            // Remove spaces
+        .replace(/[^a-zA-Z0-9]/g, '')   // Keep only alphanumeric
+        .substring(0, 20);              // Limit length
+      
+      if (sanitizedId.length > 5) {
+        log(`Sanitized postId from ${postId.length} chars to "${sanitizedId}"`);
+        postId = sanitizedId;
+      }
     }
     
     log(`Processing audio for post: ${postId}`);
@@ -659,14 +771,36 @@ export default async function(context) {
           };
           
           try {
-            await databases.createDocument(
-              APPWRITE_DATABASE_ID,
-              'function_executions', // Create this collection in your Appwrite dashboard
-              recordId,
-              eventData
-            );
-            log(`Logged execution event: ${recordId}`);
+            // Only try to log if logs collection exists - don't break execution if it doesn't
+            // Check if collection exists first or use a known existing collection
+            if (process.env.APPWRITE_COLLECTION_ID_LOGS) {
+              await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                process.env.APPWRITE_COLLECTION_ID_LOGS,
+                recordId,
+                eventData
+              );
+              log(`Logged execution event: ${recordId}`);
+            } else {
+              // Optional fallback - update post with execution info if available
+              if (post && post.$id) {
+                await databases.updateDocument(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_COLLECTION_ID_POST,
+                  post.$id,
+                  {
+                    last_execution_info: JSON.stringify({
+                      timestamp: executionRecord.timestamp,
+                      status: executionRecord.status,
+                      execution_time_ms: executionRecord.execution_time_ms
+                    })
+                  }
+                );
+                log('Logged execution summary to post document');
+              }
+            }
           } catch (logError) {
+            // Just log the error, don't break execution
             console.error('Failed to log execution event:', logError);
           }
         }
@@ -728,14 +862,36 @@ export default async function(context) {
             };
             
             try {
-              await databases.createDocument(
-                APPWRITE_DATABASE_ID,
-                'function_executions', // Create this collection in your Appwrite dashboard
-                recordId,
-                eventData
-              );
-              log(`Logged execution event: ${recordId}`);
+              // Only try to log if logs collection exists - don't break execution if it doesn't
+              // Check if collection exists first or use a known existing collection
+              if (process.env.APPWRITE_COLLECTION_ID_LOGS) {
+                await databases.createDocument(
+                  APPWRITE_DATABASE_ID,
+                  process.env.APPWRITE_COLLECTION_ID_LOGS,
+                  recordId,
+                  eventData
+                );
+                log(`Logged execution event: ${recordId}`);
+              } else {
+                // Optional fallback - update post with execution info if available
+                if (post && post.$id) {
+                  await databases.updateDocument(
+                    APPWRITE_DATABASE_ID,
+                    APPWRITE_COLLECTION_ID_POST,
+                    post.$id,
+                    {
+                      last_execution_info: JSON.stringify({
+                        timestamp: executionRecord.timestamp,
+                        status: executionRecord.status,
+                        execution_time_ms: executionRecord.execution_time_ms
+                      })
+                    }
+                  );
+                  log('Logged execution summary to post document');
+                }
+              }
             } catch (logError) {
+              // Just log the error, don't break execution
               console.error('Failed to log execution event:', logError);
             }
           }
@@ -809,14 +965,36 @@ export default async function(context) {
           };
           
           try {
-            await databases.createDocument(
-              APPWRITE_DATABASE_ID,
-              'function_executions', // Create this collection in your Appwrite dashboard
-              recordId,
-              eventData
-            );
-            log(`Logged execution event: ${recordId}`);
+            // Only try to log if logs collection exists - don't break execution if it doesn't
+            // Check if collection exists first or use a known existing collection
+            if (process.env.APPWRITE_COLLECTION_ID_LOGS) {
+              await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                process.env.APPWRITE_COLLECTION_ID_LOGS,
+                recordId,
+                eventData
+              );
+              log(`Logged execution event: ${recordId}`);
+            } else {
+              // Optional fallback - update post with execution info if available
+              if (post && post.$id) {
+                await databases.updateDocument(
+                  APPWRITE_DATABASE_ID,
+                  APPWRITE_COLLECTION_ID_POST,
+                  post.$id,
+                  {
+                    last_execution_info: JSON.stringify({
+                      timestamp: executionRecord.timestamp,
+                      status: executionRecord.status,
+                      execution_time_ms: executionRecord.execution_time_ms
+                    })
+                  }
+                );
+                log('Logged execution summary to post document');
+              }
+            }
           } catch (logError) {
+            // Just log the error, don't break execution
             console.error('Failed to log execution event:', logError);
           }
         }
@@ -859,30 +1037,40 @@ export default async function(context) {
 // This ensures that if Appwrite calls our function with a single context object,
 // it will still work correctly
 export const handler = async (context) => {
-  console.log('[APPWRITE_FUNCTION] Handler called with context:', typeof context);
-  
-  if (!context) {
-    console.log('[APPWRITE_FUNCTION] Warning: context is undefined in handler');
-    context = { req: {}, res: { json: (data) => data } };
-  }
-  
-  // Ensure req and res exist
-  if (!context.req) {
-    console.log('[APPWRITE_FUNCTION] Warning: context.req is undefined, creating empty object');
-    context.req = {};
-  }
-  
-  if (!context.res || typeof context.res.json !== 'function') {
-    console.log('[APPWRITE_FUNCTION] Warning: context.res or res.json is undefined, creating fallback');
-    context.res = {
-      json: (data) => {
-        console.log('[APPWRITE_FUNCTION] Using fallback res.json:', JSON.stringify(data));
-        return data;
-      }
+  try {
+    console.log('[APPWRITE_FUNCTION] Handler called with context:', typeof context);
+    
+    if (!context) {
+      console.log('[APPWRITE_FUNCTION] Warning: context is undefined in handler');
+      context = { req: {}, res: { json: (data) => data } };
+    }
+    
+    // Ensure req and res exist
+    if (!context.req) {
+      console.log('[APPWRITE_FUNCTION] Warning: context.req is undefined, creating empty object');
+      context.req = {};
+    }
+    
+    if (!context.res || typeof context.res.json !== 'function') {
+      console.log('[APPWRITE_FUNCTION] Warning: context.res or res.json is undefined, creating fallback');
+      context.res = {
+        json: (data) => {
+          console.log('[APPWRITE_FUNCTION] Using fallback res.json:', JSON.stringify(data));
+          return data;
+        }
+      };
+    }
+    
+    console.log('[APPWRITE_FUNCTION] Function called via handler method');
+    // Call our main implementation with the context object
+    return await exports.default(context);
+  } catch (handlerError) {
+    console.error('[APPWRITE_FUNCTION] Fatal error in handler:', handlerError);
+    // Provide basic fallback response
+    return {
+      success: false,
+      message: 'Function handler error',
+      error: handlerError.message || 'Unknown error'
     };
   }
-  
-  console.log('[APPWRITE_FUNCTION] Function called via handler method');
-  // Call our main implementation with the context object
-  return await exports.default(context);
 }; 
