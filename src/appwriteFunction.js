@@ -113,6 +113,27 @@ module.exports = async function(req, res) {
       context.log(`Received ${context.req.method} request`);
     }
     
+    // DEBUG: Log the full raw request body for debugging
+    if (context.req && context.req.body) {
+      context.log('DEBUG - Full request body:');
+      if (typeof context.req.body === 'string') {
+        context.log(`"${context.req.body}"`);
+      } else {
+        context.log(JSON.stringify(context.req.body, null, 2));
+      }
+      
+      // Check if there's a special test flag
+      const testMode = context.req.body === 'test' || 
+                       (typeof context.req.body === 'string' && context.req.body.includes('test')) ||
+                       (context.req.headers && context.req.headers['x-test-mode']);
+      
+      if (testMode) {
+        context.log('TEST MODE DETECTED - Using test postId');
+        // Use a test postId - replace with a valid ID from your database
+        payload = { postId: '656b66339fa5f91c2b73' };
+      }
+    }
+    
     // Handle potential errors with request body due to invalid content-type
     if (context.req) {
       try {
@@ -229,6 +250,26 @@ module.exports = async function(req, res) {
         // Try to get postId from route params
         payload.postId = context.req.params.postId;
         context.log(`Found postId in route params: ${payload.postId}`);
+      } else if (context.req.url) {
+        // Try to extract postId from URL parameters
+        try {
+          const url = new URL(context.req.url);
+          const urlParams = new URLSearchParams(url.search);
+          if (urlParams.has('postId')) {
+            payload.postId = urlParams.get('postId');
+            context.log(`Found postId in URL parameters: ${payload.postId}`);
+          } else if (url.pathname) {
+            // Try to extract from pathname
+            const pathParts = url.pathname.split('/');
+            const lastPart = pathParts[pathParts.length - 1];
+            if (lastPart && lastPart.length > 10) { // Assuming it might be an ID
+              payload.postId = lastPart;
+              context.log(`Extracted potential postId from URL path: ${payload.postId}`);
+            }
+          }
+        } catch (urlError) {
+          context.error('Error parsing URL:', urlError.message);
+        }
       } else if (context.req.path) {
         // Try to extract postId from path as last resort
         const pathParts = context.req.path.split('/');
@@ -254,10 +295,37 @@ module.exports = async function(req, res) {
     
     if (!postId) {
       context.log('No postId found in any request property');
-      return context.res.json({
-        success: false,
-        message: 'No postId found in request'
-      });
+      
+      // Last resort: Check if we're in a test/development environment
+      if (process.env.NODE_ENV === 'development' || process.env.APPWRITE_FUNCTION_NAME?.includes('dev')) {
+        context.log('DEVELOPMENT MODE - Using fallback test postId');
+        // Use a test ID in development mode
+        postId = '656b66339fa5f91c2b73'; // Replace with a valid ID
+      } else {
+        // Check if we have direct access to Appwrite event data
+        if (req && req.variables && req.variables.$id) {
+          postId = req.variables.$id;
+          context.log(`Using document ID from Appwrite event variables: ${postId}`);
+        } else if (req && req.path && req.path.includes('/databases/')) {
+          // Extract ID from Appwrite webhook path pattern
+          const parts = req.path.split('/');
+          // The pattern might be like /databases/{db}/collections/{coll}/documents/{id}
+          for (let i = 0; i < parts.length - 1; i++) {
+            if (parts[i] === 'documents' && parts[i+1]) {
+              postId = parts[i+1];
+              context.log(`Extracted document ID from webhook path: ${postId}`);
+              break;
+            }
+          }
+        }
+      }
+      
+      if (!postId) {
+        return context.res.json({
+          success: false,
+          message: 'No postId found in request'
+        });
+      }
     }
     
     context.log(`Processing audio for post: ${postId}`);
