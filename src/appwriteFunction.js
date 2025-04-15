@@ -9,8 +9,27 @@ import ffmpeg from 'fluent-ffmpeg';
 
 // Main entry point for Appwrite Function - Single context parameter format
 export default async function(context) {
-  // Destructure context object for easier access to properties
-  const { req, res, log, error } = context;
+  // Safely extract functions from context with fallbacks
+  const req = context.req || {};
+  const res = {
+    json: (data) => {
+      if (context.res && typeof context.res.json === 'function') {
+        return context.res.json(data);
+      }
+      // Fallback if res.json doesn't exist
+      console.log('[APPWRITE_FUNCTION] res.json fallback used:', JSON.stringify(data));
+      return data;
+    }
+  };
+  
+  // Create safe logging functions
+  const log = (context.log && typeof context.log === 'function') 
+    ? context.log 
+    : (...args) => console.log('[APPWRITE_FUNCTION]', ...args);
+    
+  const logError = (context.error && typeof context.error === 'function')
+    ? context.error
+    : (...args) => console.error('[APPWRITE_FUNCTION_ERROR]', ...args);
   
   log('Audio processing function started');
   log('Request details:');
@@ -49,9 +68,12 @@ export default async function(context) {
   const databases = new Databases(client);
   const storage = new Storage(client);
   
+  // Initialize payload and postId as empty at the function level to avoid undefined errors
+  let payload = {};
+  let postId = null;
+  
   try {
     // Parse request body and extract payload
-    let payload = {};
     
     // DEBUG: Log the full raw request body for debugging
     if (req.body !== undefined) {
@@ -64,7 +86,7 @@ export default async function(context) {
               payload = JSON.parse(req.body);
               log('Parsed JSON payload successfully');
             } catch (parseError) {
-              error('JSON parse error:', parseError.message);
+              logError('JSON parse error:', parseError.message);
               payload = { postId: req.body.trim() };
               log('Using raw body as postId fallback');
             }
@@ -74,12 +96,12 @@ export default async function(context) {
           log('Body is already an object');
         }
       } catch (bodyError) {
-        error('Error processing body:', bodyError);
+        logError('Error processing body:', bodyError);
       }
     }
     
     // Try to extract postId from various sources
-    let postId = payload.postId;
+    postId = payload.postId;
     
     // Check URL parameters
     if (!postId && req.url) {
@@ -91,7 +113,7 @@ export default async function(context) {
           log(`Found postId in URL params: ${postId}`);
         }
       } catch (urlError) {
-        error('URL parsing error:', urlError);
+        logError('URL parsing error:', urlError);
       }
     }
     
@@ -108,7 +130,7 @@ export default async function(context) {
           log(`Extracted postId from event: ${postId}`);
         }
       } catch (eventError) {
-        error('Event parsing error:', eventError);
+        logError('Event parsing error:', eventError);
       }
     }
     
@@ -136,6 +158,14 @@ export default async function(context) {
       APPWRITE_COLLECTION_ID_POST,
       postId
     );
+    
+    if (!post) {
+      log(`Post not found: ${postId}`);
+      return res.json({
+        success: false,
+        message: 'Post not found'
+      });
+    }
     
     log(`Retrieved post: ${post.$id}`);
     
@@ -265,7 +295,7 @@ export default async function(context) {
             resolve();
           })
           .on('error', err => {
-            error('Error during HLS segmentation:', err);
+            logError('Error during HLS segmentation:', err);
             reject(err);
           })
           .run();
@@ -400,7 +430,7 @@ export default async function(context) {
         
         log('Cleaned up temporary files');
       } catch (cleanupError) {
-        error('Error cleaning up temp files:', cleanupError);
+        logError('Error cleaning up temp files:', cleanupError);
         // Continue execution even if cleanup fails
       }
       
@@ -413,23 +443,29 @@ export default async function(context) {
         hls_playlist_id: playlistUploadResult.$id
       });
     } catch (error) {
-      error('Error processing audio:', error);
+      logError('Error processing audio:', error);
       
       try {
-        // Update post with error status
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
-          post.$id,
-          {
-            processing_status: 'failed',
-            processing_error: error.message,
-            processing_completed_at: new Date().toISOString()
-          }
-        );
-        log(`Updated post ${post.$id} with error status`);
+        // Ensure postId is defined before using it
+        const safePostId = postId || (payload && payload.postId) || null;
+        
+        if (safePostId) {
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_COLLECTION_ID_POST,
+            safePostId,
+            {
+              processing_status: 'failed',
+              processing_error: error.message,
+              processing_completed_at: new Date().toISOString()
+            }
+          );
+          log(`Updated post ${safePostId} with error status`);
+        } else {
+          log('Cannot update post with error status: postId is not defined');
+        }
       } catch (updateError) {
-        error('Failed to update post with error status:', updateError);
+        logError('Failed to update post with error status:', updateError);
       }
       
       // Clean up temp directory if it exists
@@ -439,7 +475,7 @@ export default async function(context) {
           log('Cleaned up temporary directory after error');
         }
       } catch (cleanupError) {
-        error('Error cleaning up temp directory:', cleanupError);
+        logError('Error cleaning up temp directory:', cleanupError);
       }
       
       // Return error response
@@ -450,24 +486,29 @@ export default async function(context) {
       });
     }
   } catch (error) {
-    error('Error processing audio:', error);
+    logError('Error processing audio:', error);
     
     try {
-      if (postId) {
+      // Ensure postId is defined before using it
+      const safePostId = postId || (payload && payload.postId) || null;
+      
+      if (safePostId) {
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
           APPWRITE_COLLECTION_ID_POST,
-          postId,
+          safePostId,
           {
             processing_status: 'failed',
             processing_error: error.message,
             processing_completed_at: new Date().toISOString()
           }
         );
-        log(`Updated post ${postId} with error status`);
+        log(`Updated post ${safePostId} with error status`);
+      } else {
+        log('Cannot update post with error status: postId is not defined');
       }
     } catch (updateError) {
-      error('Failed to update post with error status:', updateError);
+      logError('Failed to update post with error status:', updateError);
     }
     
     // Return error response
@@ -483,9 +524,27 @@ export default async function(context) {
 // This ensures that if Appwrite calls our function with a single context object,
 // it will still work correctly
 export const handler = async (context) => {
+  console.log('[APPWRITE_FUNCTION] Handler called with context:', typeof context);
+  
   if (!context) {
     console.log('[APPWRITE_FUNCTION] Warning: context is undefined in handler');
     context = { req: {}, res: { json: (data) => data } };
+  }
+  
+  // Ensure req and res exist
+  if (!context.req) {
+    console.log('[APPWRITE_FUNCTION] Warning: context.req is undefined, creating empty object');
+    context.req = {};
+  }
+  
+  if (!context.res || typeof context.res.json !== 'function') {
+    console.log('[APPWRITE_FUNCTION] Warning: context.res or res.json is undefined, creating fallback');
+    context.res = {
+      json: (data) => {
+        console.log('[APPWRITE_FUNCTION] Using fallback res.json:', JSON.stringify(data));
+        return data;
+      }
+    };
   }
   
   console.log('[APPWRITE_FUNCTION] Function called via handler method');
