@@ -46,30 +46,74 @@ module.exports = async function(req, res) {
     const payload = req.body || {};
     let postId;
     
-    // Case 1: Direct API call with postId
+    // Case 1: Direct call with postId
     if (payload.postId) {
       postId = payload.postId;
       console.log(`Direct call to process post: ${postId}`);
     } 
     // Case 2: Event trigger (document creation/update)
     else if (payload.event && payload.payload && payload.payload.$id) {
-      if (payload.event.includes('documents') && 
-          (payload.event.includes('create') || payload.event.includes('update'))) {
-        postId = payload.payload.$id;
-        console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+      // Проверка, что событие относится к нужной базе данных и коллекции
+      if (payload.event.includes('documents')) {
+        // Извлекаем ID базы данных и коллекции из события
+        const eventParts = payload.event.split('.');
+        let databaseId = null;
+        let collectionId = null;
+        
+        // Ищем ID базы данных и коллекции в строке события
+        for (let i = 0; i < eventParts.length; i++) {
+          if (eventParts[i] === 'databases' && i + 1 < eventParts.length) {
+            databaseId = eventParts[i + 1];
+          }
+          if (eventParts[i] === 'collections' && i + 1 < eventParts.length) {
+            collectionId = eventParts[i + 1];
+          }
+        }
+        
+        console.log(`Event from database: ${databaseId}, collection: ${collectionId}`);
+        
+        // Проверяем соответствие базы данных и коллекции
+        if ((databaseId === '*' || databaseId === APPWRITE_DATABASE_ID) && 
+            (collectionId === '*' || collectionId === APPWRITE_COLLECTION_ID_POST)) {
+          
+          // Проверяем тип события (создание или обновление)
+          if (payload.event.includes('create') || payload.event.includes('update')) {
+            postId = payload.payload.$id;
+            console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+          } else {
+            if (res) {
+              return res.json({
+                success: false,
+                message: 'Unsupported event action (not create or update)'
+              });
+            }
+          }
+        } else {
+          console.log('Event is for different database or collection, ignoring');
+          if (res) {
+            return res.json({
+              success: false,
+              message: 'Event from incorrect database or collection'
+            });
+          }
+        }
       } else {
-        return res.json({
-          success: false,
-          message: 'Unsupported event type'
-        });
+        if (res) {
+          return res.json({
+            success: false,
+            message: 'Unsupported event type (not document event)'
+          });
+        }
       }
     } 
     // No valid trigger found
     else {
-      return res.json({
-        success: false,
-        message: 'Missing postId in payload'
-      });
+      if (res) {
+        return res.json({
+          success: false,
+          message: 'Missing postId in payload'
+        });
+      }
     }
     
     // Get the post from database
@@ -83,20 +127,24 @@ module.exports = async function(req, res) {
     // Check if post needs processing
     if (!post.audio_url) {
       console.log(`Post ${postId} has no audio file to process`);
-      return res.json({
-        success: false,
-        message: 'Post has no audio file to process'
-      });
+      if (res) {
+        return res.json({
+          success: false,
+          message: 'Post has no audio file to process'
+        });
+      }
     }
     
     if (post.mp3_url) {
       console.log(`Post ${postId} is already processed`);
-      return res.json({
-        success: true,
-        message: 'Post already processed',
-        mp3_url: post.mp3_url,
-        m3u8_url: post.m3u8_url
-      });
+      if (res) {
+        return res.json({
+          success: true,
+          message: 'Post already processed',
+          mp3_url: post.mp3_url,
+          m3u8_url: post.m3u8_url
+        });
+      }
     }
     
     // Update status to processing
@@ -319,14 +367,16 @@ module.exports = async function(req, res) {
     }
     
     console.log(`Audio processing for post ${postId} completed successfully`);
-    return res.json({
-      success: true,
-      message: 'Successfully processed audio',
-      postId: postId,
-      mp3Id: mp3File.$id,
-      playlistId: playlist.$id,
-      segmentCount: Object.values(segmentFileIds).length
-    });
+    if (res) {
+      return res.json({
+        success: true,
+        message: 'Successfully processed audio',
+        postId: postId,
+        mp3Id: mp3File.$id,
+        playlistId: playlist.$id,
+        segmentCount: Object.values(segmentFileIds).length
+      });
+    }
   } catch (error) {
     console.error('Error processing audio:', error);
     
@@ -349,10 +399,12 @@ module.exports = async function(req, res) {
       console.error('Failed to update post with error status:', updateError);
     }
     
-    return res.json({
-      success: false,
-      message: 'Error processing audio',
-      error: error.message
-    });
+    if (res) {
+      return res.json({
+        success: false,
+        message: 'Error processing audio',
+        error: error.message
+      });
+    }
   }
 }; 

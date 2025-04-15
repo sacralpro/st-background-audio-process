@@ -2,7 +2,6 @@ const nodeExternals = require('webpack-node-externals');
 
 module.exports = {
   mode: 'production',
-  externalsPresets: { node: true },
   externals: [nodeExternals({
     // Allow bundling these packages from node_modules
     allowlist: ['node-appwrite'] 
