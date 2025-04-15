@@ -92,13 +92,34 @@ module.exports = async function(req, res) {
           payload = JSON.parse(trimmedBody);
         } catch (parseError) {
           context.error('Error parsing request body:', parseError.message);
-          return context.res.json({
-            success: false,
-            message: `Invalid JSON in request body: ${parseError.message}`
-          });
+          // Try to use the raw body as a fallback
+          context.log('Trying to use raw body as fallback');
+          payload = { postId: context.req.body.trim() };
         }
       } else if (typeof context.req.body === 'object') {
         payload = context.req.body;
+        context.log('Received request body as object');
+      }
+    } else if (context.req && context.req.headers && context.req.headers['x-appwrite-trigger']) {
+      // This might be a webhook or scheduled event from Appwrite
+      context.log('Detected Appwrite trigger event');
+      
+      if (context.req.headers['x-appwrite-trigger'] === 'event') {
+        // This is an event trigger
+        context.log('Processing event trigger');
+        // Try to extract postId from event payload if it exists
+        if (context.req.payload && context.req.payload.$id) {
+          payload = { postId: context.req.payload.$id };
+          context.log(`Extracted postId from event payload: ${payload.postId}`);
+        }
+      } else if (context.req.headers['x-appwrite-trigger'] === 'schedule') {
+        // This is a scheduled trigger
+        context.log('Processing scheduled trigger');
+        // Try to extract data from scheduled payload
+        if (context.req.payload) {
+          payload = context.req.payload;
+          context.log('Extracted payload from scheduled event');
+        }
       }
     }
     
@@ -107,13 +128,42 @@ module.exports = async function(req, res) {
       context.log('Payload:', JSON.stringify(payload).substring(0, 200) + '...');
     } else {
       context.log('Empty payload received');
+      payload = {}; // Ensure payload is an object
+      
+      // Try to find postId in various places as fallback
+      if (context.req.query && context.req.query.postId) {
+        // Try to get postId from query params
+        payload.postId = context.req.query.postId;
+        context.log(`Found postId in query params: ${payload.postId}`);
+      } else if (context.req.params && context.req.params.postId) {
+        // Try to get postId from route params
+        payload.postId = context.req.params.postId;
+        context.log(`Found postId in route params: ${payload.postId}`);
+      } else if (context.req.path) {
+        // Try to extract postId from path as last resort
+        const pathParts = context.req.path.split('/');
+        const lastPart = pathParts[pathParts.length - 1];
+        if (lastPart && lastPart.length > 10) { // Assuming it might be an ID
+          payload.postId = lastPart;
+          context.log(`Extracted potential postId from path: ${payload.postId}`);
+        }
+      }
     }
     
     // Extract postId from payload
-    const { postId } = payload;
+    let postId = payload.postId;
+    
+    // If still no postId, check if this is an event with post creation
+    if (!postId && payload.event && payload.payload) {
+      if (payload.event.includes('documents') && 
+          (payload.event.includes('create') || payload.event.includes('update'))) {
+        postId = payload.payload.$id;
+        context.log(`Extracted postId from event payload: ${postId}`);
+      }
+    }
     
     if (!postId) {
-      context.log('No postId found in payload');
+      context.log('No postId found in any request property');
       return context.res.json({
         success: false,
         message: 'No postId found in request'
