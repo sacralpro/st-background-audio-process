@@ -9,6 +9,10 @@ import ffmpeg from 'fluent-ffmpeg';
 
 // Main entry point for Appwrite Function - Single context parameter format
 export default async function(context) {
+  // Log the full context type and structure for debugging
+  console.log('[APPWRITE_FUNCTION] Context type:', typeof context);
+  console.log('[APPWRITE_FUNCTION] Context keys:', context ? Object.keys(context).join(', ') : 'undefined');
+  
   // Safely extract functions from context with fallbacks
   const req = context.req || {};
   const res = {
@@ -78,13 +82,61 @@ export default async function(context) {
     // DEBUG: Log the full raw request body for debugging
     if (req.body !== undefined) {
       log('DEBUG - Request body exists');
+      
+      // Detailed logging for debugging
+      log('Request body type:', typeof req.body);
+      if (typeof req.body === 'string') {
+        if (req.body.length < 1000) {
+          log('Raw request body:', req.body);
+        } else {
+          log('Raw request body (truncated):', req.body.substring(0, 500) + '...');
+        }
+      } else {
+        try {
+          log('Request body (JSON):', JSON.stringify(req.body).substring(0, 500) + '...');
+        } catch (e) {
+          log('Request body: [Cannot stringify body]');
+        }
+      }
+      
+      // Safe parse body
       try {
+        // Explicitly log the raw body for debugging
+        if (typeof req.body === 'string') {
+          log('Raw body as string:', req.body);
+        } else {
+          log('Raw body type:', typeof req.body);
+        }
+        
         if (typeof req.body === 'string') {
           log('Body is string, length:', req.body.length);
           if (req.body.trim().length > 0) {
             try {
-              payload = JSON.parse(req.body);
-              log('Parsed JSON payload successfully');
+              // Try to safely parse the JSON
+              const trimmedBody = req.body.trim();
+              // Check if the body is already a valid JSON string
+              if ((trimmedBody.startsWith('{') && trimmedBody.endsWith('}')) || 
+                  (trimmedBody.startsWith('[') && trimmedBody.endsWith(']'))) {
+                try {
+                  payload = JSON.parse(trimmedBody);
+                  log('Parsed JSON payload successfully');
+                } catch (parseError) {
+                  logError('JSON parse error:', parseError.message);
+                  // Try to extract postId directly if JSON parsing fails
+                  const postIdMatch = trimmedBody.match(/"postId"\s*:\s*"([^"]+)"/);
+                  if (postIdMatch && postIdMatch[1]) {
+                    payload = { postId: postIdMatch[1] };
+                    log('Extracted postId from invalid JSON:', postIdMatch[1]);
+                  } else {
+                    payload = { postId: trimmedBody };
+                    log('Using raw body as postId fallback');
+                  }
+                }
+              } else {
+                // If not a JSON object, use as raw postId
+                payload = { postId: trimmedBody };
+                log('Using raw body as postId (not a JSON object)');
+              }
             } catch (parseError) {
               logError('JSON parse error:', parseError.message);
               payload = { postId: req.body.trim() };
@@ -100,17 +152,65 @@ export default async function(context) {
       }
     }
     
+    // Safely try to access bodyJson if available
+    try {
+      if (req.bodyJson && typeof req.bodyJson === 'object') {
+        log('bodyJson is available, using it as payload');
+        payload = req.bodyJson;
+      }
+    } catch (jsonError) {
+      logError('Error accessing bodyJson:', jsonError);
+    }
+    
     // Try to extract postId from various sources
     postId = payload.postId;
     
     // Check URL parameters
     if (!postId && req.url) {
       try {
-        const url = new URL(req.url);
-        const params = new URLSearchParams(url.search);
+        log('Checking URL parameters for postId');
+        
+        // Enhanced URL parsing with fallbacks
+        let url;
+        let params;
+        
+        try {
+          // Regular URL parsing
+          url = new URL(req.url);
+          params = new URLSearchParams(url.search);
+          log('Parsed URL:', url.toString());
+          log('URL has search params:', url.search ? 'yes' : 'no');
+        } catch (urlParseError) {
+          // Fallback for relative URLs or non-standard URLs
+          logError('Standard URL parsing failed, trying fallback:', urlParseError.message);
+          
+          const queryPart = req.url.split('?')[1];
+          if (queryPart) {
+            params = new URLSearchParams(queryPart);
+            log('Parsed URL params using fallback method');
+          } else {
+            log('No query parameters found in URL');
+            params = new URLSearchParams();
+          }
+        }
+        
+        // Check for postId in URL params
         if (params.has('postId')) {
           postId = params.get('postId');
           log(`Found postId in URL params: ${postId}`);
+        } else {
+          // Additional check for ID in URL path
+          const pathParts = req.url.split('/');
+          const lastPart = pathParts[pathParts.length - 1];
+          
+          // Check if last part could be an ID (no slashes, reasonable length)
+          if (lastPart && lastPart.length > 5 && lastPart.length < 30 && !lastPart.includes('?')) {
+            log(`Potential ID found in URL path: ${lastPart}`);
+            if (!postId) {
+              postId = lastPart;
+              log(`Using URL path component as postId: ${postId}`);
+            }
+          }
         }
       } catch (urlError) {
         logError('URL parsing error:', urlError);
@@ -124,10 +224,40 @@ export default async function(context) {
         req.headers['x-appwrite-event'] && 
         req.headers['x-appwrite-event'].includes('documents')) {
       try {
-        // For document events, try to extract document ID
-        if (req.bodyJson && req.bodyJson.$id) {
-          postId = req.bodyJson.$id;
-          log(`Extracted postId from event: ${postId}`);
+        log('Detected Appwrite document event');
+        
+        // Safe access to req.bodyJson for events
+        let eventData = null;
+        
+        // Try multiple sources for event data
+        if (req.bodyJson) {
+          log('Using req.bodyJson for event data');
+          eventData = req.bodyJson;
+        } else if (payload && typeof payload === 'object') {
+          log('Using payload for event data');
+          eventData = payload;
+        }
+        
+        // Try to find document ID in multiple places
+        if (eventData) {
+          if (eventData.$id) {
+            postId = eventData.$id;
+            log(`Extracted postId from event $id: ${postId}`);
+          } else if (eventData.record && eventData.record.$id) {
+            postId = eventData.record.$id;
+            log(`Extracted postId from event record $id: ${postId}`);
+          } else if (eventData.document && eventData.document.$id) {
+            postId = eventData.document.$id;
+            log(`Extracted postId from event document $id: ${postId}`);
+          }
+        }
+        
+        // Log if we couldn't find an ID
+        if (!postId) {
+          log('Could not extract postId from event data');
+          if (eventData) {
+            log('Event data keys:', Object.keys(eventData || {}).join(', '));
+          }
         }
       } catch (eventError) {
         logError('Event parsing error:', eventError);
