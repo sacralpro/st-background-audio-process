@@ -41,30 +41,97 @@ module.exports = async function(req, res) {
     const payload = req.body || {};
     let postId;
     
-    // Case 1: Direct API call with postId
+<<<<<<< HEAD
+    if (!postId && payload.event && payload.payload && payload.payload.$id) {
+      if (payload.event.includes('documents') && 
+          (payload.event.includes('create') || payload.event.includes('update'))) {
+        postId = payload.payload.$id;
+        context.log(`Event trigger for post: ${postId} via ${payload.event}`);
+=======
+    // Case 1: Direct call with postId
     if (payload.postId) {
       postId = payload.postId;
       console.log(`Direct call to process post: ${postId}`);
     } 
     // Case 2: Event trigger (document creation/update)
     else if (payload.event && payload.payload && payload.payload.$id) {
-      if (payload.event.includes('documents') && 
-          (payload.event.includes('create') || payload.event.includes('update'))) {
-        postId = payload.payload.$id;
-        console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+      // Проверка, что событие относится к нужной базе данных и коллекции
+      if (payload.event.includes('documents')) {
+        // Извлекаем ID базы данных и коллекции из события
+        const eventParts = payload.event.split('.');
+        let databaseId = null;
+        let collectionId = null;
+        
+        // Ищем ID базы данных и коллекции в строке события
+        for (let i = 0; i < eventParts.length; i++) {
+          if (eventParts[i] === 'databases' && i + 1 < eventParts.length) {
+            databaseId = eventParts[i + 1];
+          }
+          if (eventParts[i] === 'collections' && i + 1 < eventParts.length) {
+            collectionId = eventParts[i + 1];
+          }
+        }
+        
+        console.log(`Event from database: ${databaseId}, collection: ${collectionId}`);
+        
+        // Проверяем соответствие базы данных и коллекции
+        if ((databaseId === '*' || databaseId === APPWRITE_DATABASE_ID) && 
+            (collectionId === '*' || collectionId === APPWRITE_COLLECTION_ID_POST)) {
+          
+          // Проверяем тип события (создание или обновление)
+          if (payload.event.includes('create') || payload.event.includes('update')) {
+            postId = payload.payload.$id;
+            console.log(`Event trigger for post: ${postId} via ${payload.event}`);
+          } else {
+            if (res) {
+              return res.json({
+                success: false,
+                message: 'Unsupported event action (not create or update)'
+              });
+            }
+          }
+        } else {
+          console.log('Event is for different database or collection, ignoring');
+          if (res) {
+            return res.json({
+              success: false,
+              message: 'Event from incorrect database or collection'
+            });
+          }
+        }
+>>>>>>> main
       } else {
-        return res.json({
-          success: false,
-          message: 'Unsupported event type'
-        });
+        if (res) {
+          return res.json({
+            success: false,
+<<<<<<< HEAD
+            message: 'Unsupported event type'
+          });
+        }
+        return context.res.empty();
+      }
+    } 
+    
+    if (!postId) {
+=======
+            message: 'Unsupported event type (not document event)'
+          });
+        }
       }
     } 
     // No valid trigger found
     else {
-      return res.json({
-        success: false,
-        message: 'Missing postId in payload'
-      });
+>>>>>>> main
+      if (res) {
+        return res.json({
+          success: false,
+          message: 'Missing postId in payload'
+        });
+      }
+<<<<<<< HEAD
+      return context.res.empty();
+=======
+>>>>>>> main
     }
     
     context.log(`Fetching post document: ${postId}`);
@@ -75,21 +142,41 @@ module.exports = async function(req, res) {
     );
     
     if (!post.audio_url) {
+<<<<<<< HEAD
+      context.log(`Post ${postId} has no audio file to process`);
+=======
       console.log(`Post ${postId} has no audio file to process`);
-      return res.json({
-        success: false,
-        message: 'Post has no audio file to process'
-      });
+>>>>>>> main
+      if (res) {
+        return res.json({
+          success: false,
+          message: 'Post has no audio file to process'
+        });
+      }
+<<<<<<< HEAD
+      return context.res.empty();
+    }
+    
+    if (post.mp3_url) {
+      context.log(`Post ${postId} is already processed`);
+=======
     }
     
     if (post.mp3_url) {
       console.log(`Post ${postId} is already processed`);
-      return res.json({
-        success: true,
-        message: 'Post already processed',
-        mp3_url: post.mp3_url,
-        m3u8_url: post.m3u8_url
-      });
+>>>>>>> main
+      if (res) {
+        return res.json({
+          success: true,
+          message: 'Post already processed',
+          mp3_url: post.mp3_url,
+          m3u8_url: post.m3u8_url
+        });
+      }
+<<<<<<< HEAD
+      return context.res.empty();
+=======
+>>>>>>> main
     }
     
     context.log(`Updating post ${postId} status to processing`);
@@ -310,15 +397,25 @@ module.exports = async function(req, res) {
       await unlinkAsync(path.join(segmentsDir, file));
     }
     
+<<<<<<< HEAD
+    context.log(`Audio processing for post ${postId} completed successfully`);
+=======
     console.log(`Audio processing for post ${postId} completed successfully`);
-    return res.json({
-      success: true,
-      message: 'Successfully processed audio',
-      postId: postId,
-      mp3Id: mp3File.$id,
-      playlistId: playlist.$id,
-      segmentCount: Object.values(segmentFileIds).length
-    });
+>>>>>>> main
+    if (res) {
+      return res.json({
+        success: true,
+        message: 'Successfully processed audio',
+        postId: postId,
+        mp3Id: mp3File.$id,
+        playlistId: playlist.$id,
+        segmentCount: Object.values(segmentFileIds).length
+      });
+    }
+<<<<<<< HEAD
+    return context.res.empty();
+=======
+>>>>>>> main
   } catch (error) {
     context.error('Error processing audio:', error);
     
@@ -340,10 +437,16 @@ module.exports = async function(req, res) {
       context.error('Failed to update post with error status:', updateError);
     }
     
-    return res.json({
-      success: false,
-      message: 'Error processing audio',
-      error: error.message
-    });
+    if (res) {
+      return res.json({
+        success: false,
+        message: 'Error processing audio',
+        error: error.message
+      });
+    }
+<<<<<<< HEAD
+    return context.res.empty();
+=======
+>>>>>>> main
   }
 }; 
