@@ -53,7 +53,7 @@ module.exports = async function(req, res) {
             message: 'Unsupported event type'
           });
         }
-        return res.empty();
+        return;
       }
     } 
     
@@ -64,7 +64,7 @@ module.exports = async function(req, res) {
           message: 'Missing postId in payload'
         });
       }
-      return res.empty();
+      return;
     }
     
     console.log(`Fetching post document: ${postId}`);
@@ -82,7 +82,7 @@ module.exports = async function(req, res) {
           message: 'Post has no audio file to process'
         });
       }
-      return res.empty();
+      return;
     }
     
     if (post.mp3_url) {
@@ -95,7 +95,7 @@ module.exports = async function(req, res) {
           m3u8_url: post.m3u8_url
         });
       }
-      return res.empty();
+      return;
     }
     
     console.log(`Updating post ${postId} status to processing`);
@@ -327,7 +327,7 @@ module.exports = async function(req, res) {
         segmentCount: Object.values(segmentFileIds).length
       });
     }
-    return res.empty();
+    return;
   } catch (error) {
     console.error('Error processing audio:', error);
     
@@ -356,6 +356,6 @@ module.exports = async function(req, res) {
         error: error.message
       });
     }
-    return res.empty();
+    return;
   }
 }; 
