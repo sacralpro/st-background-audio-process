@@ -9,6 +9,20 @@ import ffmpeg from 'fluent-ffmpeg';
 
 // Main entry point for Appwrite Function - Single context parameter format
 export default async function(context) {
+  // Start tracking execution time
+  const startTime = Date.now();
+  
+  // Initialize a safe execution status record
+  let executionRecord = {
+    timestamp: new Date().toISOString(),
+    status: 'started',
+    trigger_type: 'unknown',
+    error: null,
+    parsing_error: null,
+    request_info: {},
+    execution_time_ms: 0
+  };
+  
   // Log the full context type and structure for debugging
   console.log('[APPWRITE_FUNCTION] Context type:', typeof context);
   console.log('[APPWRITE_FUNCTION] Context keys:', context ? Object.keys(context).join(', ') : 'undefined');
@@ -37,11 +51,22 @@ export default async function(context) {
   
   log('Audio processing function started');
   log('Request details:');
-  log('- Method:', req.method || 'unknown');
-  log('- URL:', req.url || 'unknown');
+  
+  // Store basic request info
+  executionRecord.request_info = {
+    method: req.method || 'unknown',
+    url: req.url || 'unknown',
+    content_type: req.headers ? (req.headers['content-type'] || 'none') : 'none',
+    trigger: req.headers ? (req.headers['x-appwrite-trigger'] || 'none') : 'none'
+  };
+  
+  executionRecord.trigger_type = executionRecord.request_info.trigger;
+  
+  log('- Method:', executionRecord.request_info.method);
+  log('- URL:', executionRecord.request_info.url);
   if (req.headers) {
-    log('- Content-Type:', req.headers['content-type'] || 'none');
-    log('- Trigger:', req.headers['x-appwrite-trigger'] || 'none');
+    log('- Content-Type:', executionRecord.request_info.content_type);
+    log('- Trigger:', executionRecord.request_info.trigger);
   }
   
   // Promisify fs functions
@@ -104,6 +129,15 @@ export default async function(context) {
         // Explicitly log the raw body for debugging
         if (typeof req.body === 'string') {
           log('Raw body as string:', req.body);
+          
+          // Check for non-printable characters
+          const hasNonPrintable = /[\x00-\x1F\x7F-\x9F]/.test(req.body);
+          if (hasNonPrintable) {
+            log('WARNING: Non-printable characters detected in the body');
+            // Show hex representation for debugging
+            const hexBody = Array.from(req.body).map(c => c.charCodeAt(0).toString(16).padStart(2, '0')).join(' ');
+            log('Body as hex (first 100 bytes):', hexBody.substring(0, 300));
+          }
         } else {
           log('Raw body type:', typeof req.body);
         }
@@ -112,30 +146,56 @@ export default async function(context) {
           log('Body is string, length:', req.body.length);
           if (req.body.trim().length > 0) {
             try {
-              // Try to safely parse the JSON
-              const trimmedBody = req.body.trim();
+              // Try to safely parse the JSON with more aggressive cleaning
+              // Strip BOM, whitespace, and other common problematic characters
+              let cleanedBody = req.body
+                .replace(/^\uFEFF/, '')                  // BOM
+                .replace(/^\s+|\s+$/g, '')               // Leading/trailing whitespace
+                .replace(/\u200B/g, '')                  // Zero-width space
+                .replace(/[\x00-\x1F\x7F-\x9F]/g, '');   // Control characters
+              
+              // Find the first '{' and last '}' for JSON objects, or first '[' and last ']' for arrays
+              const firstBrace = cleanedBody.indexOf('{');
+              const lastBrace = cleanedBody.lastIndexOf('}');
+              const firstBracket = cleanedBody.indexOf('[');
+              const lastBracket = cleanedBody.lastIndexOf(']');
+              
+              // Determine if this looks like a JSON object or array
+              let jsonContent = cleanedBody;
+              
+              if (firstBrace >= 0 && lastBrace > firstBrace) {
+                // Extract just the JSON object
+                jsonContent = cleanedBody.substring(firstBrace, lastBrace + 1);
+                log('Extracted JSON object from content');
+              } else if (firstBracket >= 0 && lastBracket > firstBracket) {
+                // Extract just the JSON array
+                jsonContent = cleanedBody.substring(firstBracket, lastBracket + 1);
+                log('Extracted JSON array from content');
+              }
+              
               // Check if the body is already a valid JSON string
-              if ((trimmedBody.startsWith('{') && trimmedBody.endsWith('}')) || 
-                  (trimmedBody.startsWith('[') && trimmedBody.endsWith(']'))) {
+              if ((jsonContent.startsWith('{') && jsonContent.endsWith('}')) || 
+                  (jsonContent.startsWith('[') && jsonContent.endsWith(']'))) {
                 try {
-                  payload = JSON.parse(trimmedBody);
+                  log('Attempting to parse cleaned JSON:', jsonContent.substring(0, 100) + (jsonContent.length > 100 ? '...' : ''));
+                  payload = JSON.parse(jsonContent);
                   log('Parsed JSON payload successfully');
                 } catch (parseError) {
-                  logError('JSON parse error:', parseError.message);
+                  logError('JSON parse error after cleaning:', parseError.message);
                   // Try to extract postId directly if JSON parsing fails
-                  const postIdMatch = trimmedBody.match(/"postId"\s*:\s*"([^"]+)"/);
+                  const postIdMatch = jsonContent.match(/"postId"\s*:\s*"([^"]+)"/);
                   if (postIdMatch && postIdMatch[1]) {
                     payload = { postId: postIdMatch[1] };
                     log('Extracted postId from invalid JSON:', postIdMatch[1]);
                   } else {
-                    payload = { postId: trimmedBody };
-                    log('Using raw body as postId fallback');
+                    payload = { postId: jsonContent };
+                    log('Using cleaned content as postId fallback');
                   }
                 }
               } else {
                 // If not a JSON object, use as raw postId
-                payload = { postId: trimmedBody };
-                log('Using raw body as postId (not a JSON object)');
+                payload = { postId: cleanedBody };
+                log('Using cleaned body as postId (not a JSON object)');
               }
             } catch (parseError) {
               logError('JSON parse error:', parseError.message);
@@ -154,9 +214,22 @@ export default async function(context) {
     
     // Safely try to access bodyJson if available
     try {
-      if (req.bodyJson && typeof req.bodyJson === 'object') {
-        log('bodyJson is available, using it as payload');
-        payload = req.bodyJson;
+      if (req.bodyJson) {
+        if (typeof req.bodyJson === 'object') {
+          log('bodyJson is available and is an object, using it as payload');
+          payload = req.bodyJson;
+        } else if (typeof req.bodyJson === 'string') {
+          // Try to parse bodyJson if it's a string
+          try {
+            const parsedJson = JSON.parse(req.bodyJson);
+            log('Parsed bodyJson string to object');
+            payload = parsedJson;
+          } catch (parseError) {
+            logError('Failed to parse bodyJson string:', parseError.message);
+          }
+        } else {
+          log('bodyJson is available but type is unexpected:', typeof req.bodyJson);
+        }
       }
     } catch (jsonError) {
       logError('Error accessing bodyJson:', jsonError);
@@ -564,20 +637,114 @@ export default async function(context) {
         // Continue execution even if cleanup fails
       }
       
+      // Update execution record
+      executionRecord.status = 'completed';
+      executionRecord.execution_time_ms = Date.now() - startTime;
+      
+      // Log execution attempt to database regardless of success/failure
+      try {
+        // Create a processing event record if we have client connection
+        if (databases && APPWRITE_DATABASE_ID) {
+          const recordId = ID.unique();
+          const eventData = {
+            function_id: process.env.APPWRITE_FUNCTION_ID || 'unknown',
+            execution_id: recordId,
+            timestamp: executionRecord.timestamp,
+            status: executionRecord.status,
+            error: executionRecord.error,
+            trigger_type: executionRecord.trigger_type,
+            request_info: JSON.stringify(executionRecord.request_info),
+            post_id: post ? post.$id : (postId || 'unknown'),
+            execution_time_ms: executionRecord.execution_time_ms
+          };
+          
+          try {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              'function_executions', // Create this collection in your Appwrite dashboard
+              recordId,
+              eventData
+            );
+            log(`Logged execution event: ${recordId}`);
+          } catch (logError) {
+            console.error('Failed to log execution event:', logError);
+          }
+        }
+      } catch (logError) {
+        console.error('Failed to create execution log:', logError);
+      }
+      
+      // Ensure postId is defined before using it
+      const safePostId = (post ? post.$id : null) || postId || (payload && payload.postId) || null;
+      
+      if (safePostId) {
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          safePostId,
+          {
+            processing_status: 'completed',
+            processing_progress: 100,
+            processing_completed_at: new Date().toISOString()
+          }
+        );
+        log(`Updated post ${safePostId} with completed status`);
+      } else {
+        log('Cannot update post with completed status: postId is not defined');
+      }
+      
       // Return success response
       return res.json({
         success: true,
         message: 'Audio processing completed',
-        postId: post.$id,
+        postId: safePostId,
         mp3_file_id: mp3UploadResult.$id,
         hls_playlist_id: playlistUploadResult.$id
       });
     } catch (error) {
       logError('Error processing audio:', error);
       
+      // Update execution record
+      executionRecord.status = 'error';
+      executionRecord.error = error.message;
+      executionRecord.execution_time_ms = Date.now() - startTime;
+      
       try {
+        // Log execution attempt to database regardless of success/failure
+        try {
+          // Create a processing event record if we have client connection
+          if (databases && APPWRITE_DATABASE_ID) {
+            const recordId = ID.unique();
+            const eventData = {
+              function_id: process.env.APPWRITE_FUNCTION_ID || 'unknown',
+              execution_id: recordId,
+              timestamp: executionRecord.timestamp,
+              status: executionRecord.status,
+              error: executionRecord.error,
+              trigger_type: executionRecord.trigger_type,
+              request_info: JSON.stringify(executionRecord.request_info),
+              post_id: post ? post.$id : (postId || 'unknown'),
+              execution_time_ms: executionRecord.execution_time_ms
+            };
+            
+            try {
+              await databases.createDocument(
+                APPWRITE_DATABASE_ID,
+                'function_executions', // Create this collection in your Appwrite dashboard
+                recordId,
+                eventData
+              );
+              log(`Logged execution event: ${recordId}`);
+            } catch (logError) {
+              console.error('Failed to log execution event:', logError);
+            }
+          }
+        } catch (logError) {
+          console.error('Failed to create execution log:', logError);
+        }
+        
         // Ensure postId is defined before using it
-        const safePostId = postId || (payload && payload.postId) || null;
+        const safePostId = (post ? post.$id : null) || postId || (payload && payload.postId) || null;
         
         if (safePostId) {
           await databases.updateDocument(
@@ -618,7 +785,45 @@ export default async function(context) {
   } catch (error) {
     logError('Error processing audio:', error);
     
+    // Update execution record
+    executionRecord.status = 'error';
+    executionRecord.error = error.message;
+    executionRecord.execution_time_ms = Date.now() - startTime;
+    
     try {
+      // Log execution attempt to database regardless of success/failure
+      try {
+        // Create a processing event record if we have client connection
+        if (databases && APPWRITE_DATABASE_ID) {
+          const recordId = ID.unique();
+          const eventData = {
+            function_id: process.env.APPWRITE_FUNCTION_ID || 'unknown',
+            execution_id: recordId,
+            timestamp: executionRecord.timestamp,
+            status: executionRecord.status,
+            error: executionRecord.error,
+            trigger_type: executionRecord.trigger_type,
+            request_info: JSON.stringify(executionRecord.request_info),
+            post_id: postId || 'unknown',
+            execution_time_ms: executionRecord.execution_time_ms
+          };
+          
+          try {
+            await databases.createDocument(
+              APPWRITE_DATABASE_ID,
+              'function_executions', // Create this collection in your Appwrite dashboard
+              recordId,
+              eventData
+            );
+            log(`Logged execution event: ${recordId}`);
+          } catch (logError) {
+            console.error('Failed to log execution event:', logError);
+          }
+        }
+      } catch (logError) {
+        console.error('Failed to create execution log:', logError);
+      }
+      
       // Ensure postId is defined before using it
       const safePostId = postId || (payload && payload.postId) || null;
       
