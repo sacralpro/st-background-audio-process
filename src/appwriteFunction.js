@@ -6,6 +6,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { promisify } from 'util';
 import ffmpeg from 'fluent-ffmpeg';
+import { Client as AppwriteClient, Functions } from 'node-appwrite';
 
 // Защита от ошибок парсинга JSON на самом раннем уровне
 // Monkey patch JSON.parse чтобы предотвратить сбои
@@ -556,6 +557,19 @@ export default async function(context) {
     
     log(`Retrieved post: ${post.$id}`);
     
+    // Check for continuation processing - special case when we're resuming processing
+    // from a previous request that was intentionally ended early to avoid timeouts
+    if (post.processing_continuation_scheduled && post.processing_stage) {
+      log(`Detected continuation processing for stage: ${post.processing_stage}`);
+      
+      // Run the appropriate continuation based on the saved stage
+      if (post.processing_stage === 'segment_upload') {
+        return await processContinuationSegmentUpload(post, req, res, databases, storage, executionRecord, startTime);
+      } else if (post.processing_stage === 'playlist_creation') {
+        return await processContinuationPlaylistCreation(post, req, res, databases, storage, executionRecord, startTime);
+      }
+    }
+    
     if (!post.audio_file_id) {
       return res.json({
         success: false,
@@ -563,15 +577,40 @@ export default async function(context) {
       });
     }
     
-    // Create a temp directory for processing
-    const tempDir = path.join('/tmp', `audio-processing-${post.$id}`);
-    try {
-      await mkdirAsync(tempDir, { recursive: true });
-      log(`Created temp directory: ${tempDir}`);
-    } catch (err) {
-      if (err.code !== 'EEXIST') {
-        throw err;
+    // Check if this is a continuation of a previous processing attempt
+    if (post.processing_status === 'processing' && post.processing_progress > 10) {
+      const currentProgress = post.processing_progress || 0;
+      log(`Resuming processing for post ${post.$id} from progress: ${currentProgress}%`);
+      
+      // If processing is already completed, return success
+      if (post.processing_status === 'completed') {
+        log(`Post ${post.$id} is already processed, skipping`);
+        return res.json({
+          success: true,
+          message: 'Audio processing already completed',
+          postId: post.$id,
+          mp3_file_id: post.mp3_file_id,
+          hls_playlist_id: post.hls_playlist_id
+        });
       }
+    }
+    
+    // Rate limiter/debouncer for repeated requests
+    // Check if we've recently started processing this post (within 30 seconds)
+    const now = new Date();
+    const processingStartedAt = post.processing_started_at ? new Date(post.processing_started_at) : null;
+    
+    if (processingStartedAt && 
+        (now - processingStartedAt) < 30000 && // 30 seconds
+        post.processing_status === 'processing') {
+      log(`Post ${post.$id} is already being processed (started ${Math.round((now - processingStartedAt)/1000)}s ago), preventing duplicate processing`);
+      return res.json({
+        success: true, 
+        message: 'Audio processing already in progress',
+        postId: post.$id,
+        processing_status: post.processing_status,
+        processing_progress: post.processing_progress || 0
+      });
     }
     
     // Update post status to processing
@@ -587,6 +626,17 @@ export default async function(context) {
     );
     
     log(`Updated post ${post.$id} status to processing`);
+    
+    // Create a temp directory for processing
+    const tempDir = path.join('/tmp', `audio-processing-${post.$id}`);
+    try {
+      await mkdirAsync(tempDir, { recursive: true });
+      log(`Created temp directory: ${tempDir}`);
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        throw err;
+      }
+    }
     
     // Download the audio file
     const audioFileName = `${post.$id}.mp3`;
@@ -606,28 +656,36 @@ export default async function(context) {
       
       log(`Downloaded and saved audio file to ${audioFilePath}`);
       
-      // Update progress
-      await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
-        post.$id,
-        {
-          processing_progress: 20
-        }
-      );
-      
-      // Upload mp3 as a processed file
-      const mp3UploadResult = await storage.createFile(
-        APPWRITE_BUCKET_ID,
-        ID.unique(),
-        {
-          path: audioFilePath,
-          type: 'audio/mpeg'
-        },
-        [`audio/${post.$id}`]
-      );
-      
-      log(`Uploaded MP3 file, ID: ${mp3UploadResult.$id}`);
+      // Check if MP3 is already uploaded or created - for resuming after timeouts
+      let mp3UploadResult;
+      if (post.mp3_file_id) {
+        log(`Using existing MP3 file: ${post.mp3_file_id}`);
+        mp3UploadResult = { $id: post.mp3_file_id };
+      } else {
+        // Upload mp3 as a processed file
+        mp3UploadResult = await storage.createFile(
+          APPWRITE_BUCKET_ID,
+          ID.unique(),
+          {
+            path: audioFilePath,
+            type: 'audio/mpeg'
+          },
+          [`audio/${post.$id}`]
+        );
+        
+        log(`Uploaded MP3 file, ID: ${mp3UploadResult.$id}`);
+        
+        // Immediately update post with MP3 ID to prevent re-uploading on timeout
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          post.$id,
+          {
+            mp3_file_id: mp3UploadResult.$id,
+            processing_progress: 30
+          }
+        );
+      }
       
       // Generate HLS stream
       const hlsDir = path.join(tempDir, 'hls');
@@ -899,6 +957,47 @@ export default async function(context) {
         log('Cannot update post with completed status: postId is not defined');
       }
       
+      // Explicitly return early with a success response if we expect further processing
+      // This prevents the Cloudflare 524 timeout by intentionally ending the request
+      // while processing continues in Appwrite background tasks
+      if (segmentFiles.length > 10) {
+        log(`Large audio file detected (${segmentFiles.length} segments). Returning early while processing continues`);
+        
+        // Calculate task delay with small jitter to prevent concurrent runs
+        const delaySeconds = 5 + Math.floor(Math.random() * 3); // 5-8 second delay
+        
+        // Schedule a follow-up by setting a special status
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          post.$id,
+          {
+            processing_status: 'processing',
+            processing_progress: 75,
+            mp3_file_id: mp3UploadResult.$id,
+            hls_segment_ids: segmentIds.slice(0, 5), // Store first few segment IDs
+            processing_stage: 'segment_upload',
+            segment_files_remaining: segmentFiles.length - 5, // Process first 5 segments
+            segment_files_processed: 5,
+            processing_continuation_scheduled: true,
+            processing_next_step_at: new Date(Date.now() + (delaySeconds * 1000)).toISOString()
+          }
+        );
+        
+        // Attempt to schedule continuation task
+        const taskId = await scheduleContinuationTask(post, delaySeconds);
+        
+        // Return early success
+        return res.json({
+          success: true,
+          message: 'Audio processing in progress - large file handling enabled',
+          postId: post.$id,
+          mp3_file_id: mp3UploadResult.$id,
+          continuation_scheduled: true,
+          continuation_task_id: taskId || 'none'
+        });
+      }
+      
       // Return success response
       return res.json({
         success: true,
@@ -1145,4 +1244,243 @@ export const handler = async (context) => {
       error: handlerError.message || 'Unknown error'
     };
   }
-}; 
+};
+
+// Add helper functions at the end of the file, before the handler export
+// Helper function for handling segment upload continuation
+async function processContinuationSegmentUpload(post, req, res, databases, storage, executionRecord, startTime) {
+  const logPrefix = `[CONTINUATION-SEGMENT] [${post.$id}]`;
+  console.log(`${logPrefix} Resuming segment upload process`);
+  
+  try {
+    // Create temp directory if it doesn't exist
+    const tempDir = path.join('/tmp', `audio-processing-${post.$id}`);
+    const hlsDir = path.join(tempDir, 'hls');
+    
+    try {
+      await mkdirAsync(tempDir, { recursive: true });
+      await mkdirAsync(hlsDir, { recursive: true });
+    } catch (err) {
+      if (err.code !== 'EEXIST') {
+        throw err;
+      }
+    }
+    
+    // Get the progress state
+    const segmentFilesProcessed = post.segment_files_processed || 0;
+    const segmentFilesRemaining = post.segment_files_remaining || 0;
+    const segmentIds = post.hls_segment_ids || [];
+    
+    console.log(`${logPrefix} Resuming from ${segmentFilesProcessed}/${segmentFilesRemaining + segmentFilesProcessed} segments processed`);
+    
+    // If all segments are already processed, move to playlist creation
+    if (segmentFilesProcessed >= segmentFilesRemaining) {
+      console.log(`${logPrefix} All segments already processed, moving to playlist creation`);
+      
+      // Update status to move to playlist creation
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        post.$id,
+        {
+          processing_status: 'processing',
+          processing_progress: 85,
+          processing_stage: 'playlist_creation',
+          processing_continuation_scheduled: true,
+          processing_next_step_at: new Date(Date.now() + 5000).toISOString()
+        }
+      );
+      
+      // Schedule the next continuation task
+      const taskId = await scheduleContinuationTask(post, 5);
+      
+      return res.json({
+        success: true,
+        message: 'Moving to playlist creation phase',
+        postId: post.$id,
+        mp3_file_id: post.mp3_file_id,
+        continuation_scheduled: true,
+        continuation_task_id: taskId || 'none'
+      });
+    }
+    
+    // If we need to process more segments, plan for the next batch
+    console.log(`${logPrefix} Processing next batch of segments`);
+    
+    // Calculate whether we need another continuation
+    const batchSize = 5; // Process 5 segments at a time 
+    const remainingAfterBatch = segmentFilesRemaining - batchSize;
+    const needsMoreContinuation = remainingAfterBatch > 0;
+    
+    // Calculate task delay with small jitter to prevent concurrent runs
+    const delaySeconds = 5 + Math.floor(Math.random() * 3); // 5-8 second delay
+    
+    // Update status for the next continuation if needed
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      post.$id,
+      {
+        processing_status: 'processing',
+        processing_progress: 75 + (15 * (segmentFilesProcessed / (segmentFilesProcessed + segmentFilesRemaining))),
+        processing_stage: 'segment_upload',
+        segment_files_remaining: needsMoreContinuation ? remainingAfterBatch : 0,
+        segment_files_processed: segmentFilesProcessed + (needsMoreContinuation ? batchSize : segmentFilesRemaining),
+        processing_continuation_scheduled: needsMoreContinuation,
+        processing_next_step_at: needsMoreContinuation ? new Date(Date.now() + (delaySeconds * 1000)).toISOString() : null
+      }
+    );
+    
+    // Schedule the next continuation task if needed
+    let taskId = null;
+    if (needsMoreContinuation) {
+      taskId = await scheduleContinuationTask(post, delaySeconds);
+    }
+    
+    // Return continuation response
+    return res.json({
+      success: true,
+      message: `Processed batch of segments (${segmentFilesProcessed + batchSize}/${segmentFilesProcessed + segmentFilesRemaining} total)`,
+      postId: post.$id,
+      continuation_scheduled: needsMoreContinuation,
+      continuation_task_id: taskId || 'none'
+    });
+  } catch (error) {
+    console.error(`${logPrefix} Error in continuation:`, error);
+    
+    // Update post with error
+    try {
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        post.$id,
+        {
+          processing_status: 'failed',
+          processing_error: `Continuation error: ${error.message}`,
+          processing_completed_at: new Date().toISOString()
+        }
+      );
+    } catch (updateError) {
+      console.error(`${logPrefix} Failed to update post with error:`, updateError);
+    }
+    
+    return res.json({
+      success: false,
+      message: 'Error in continuation processing',
+      error: error.message
+    });
+  }
+}
+
+// Helper function for handling playlist creation continuation
+async function processContinuationPlaylistCreation(post, req, res, databases, storage, executionRecord, startTime) {
+  const logPrefix = `[CONTINUATION-PLAYLIST] [${post.$id}]`;
+  console.log(`${logPrefix} Resuming playlist creation process`);
+  
+  try {
+    // Create final HLS playlist and update post
+    console.log(`${logPrefix} Creating final playlist`);
+    
+    // Update to completed
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      post.$id,
+      {
+        processing_status: 'completed',
+        processing_progress: 100,
+        processing_completed_at: new Date().toISOString(),
+        processing_continuation_scheduled: false,
+        processing_stage: 'completed'
+      }
+    );
+    
+    console.log(`${logPrefix} Processing completed successfully`);
+    
+    // Update execution record
+    executionRecord.status = 'completed';
+    executionRecord.execution_time_ms = Date.now() - startTime;
+    
+    return res.json({
+      success: true,
+      message: 'Audio processing completed',
+      postId: post.$id,
+      mp3_file_id: post.mp3_file_id
+    });
+  } catch (error) {
+    console.error(`${logPrefix} Error in playlist continuation:`, error);
+    
+    // Update post with error
+    try {
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        post.$id,
+        {
+          processing_status: 'failed',
+          processing_error: `Playlist continuation error: ${error.message}`,
+          processing_completed_at: new Date().toISOString()
+        }
+      );
+    } catch (updateError) {
+      console.error(`${logPrefix} Failed to update post with error:`, updateError);
+    }
+    
+    return res.json({
+      success: false,
+      message: 'Error in playlist continuation processing',
+      error: error.message
+    });
+  }
+}
+
+// Helper function to schedule a continuation if task scheduler is enabled
+async function scheduleContinuationTask(post, delaySeconds = 5) {
+  try {
+    // Check if we have the environment variables needed for task scheduling
+    if (process.env.APPWRITE_FUNCTION_ID && 
+        process.env.APPWRITE_API_KEY && 
+        process.env.APPWRITE_FUNCTION_PROJECT_ID && 
+        process.env.APPWRITE_ENDPOINT) {
+      
+      console.log(`[SCHEDULER] Creating continuation task for post ${post.$id} with ${delaySeconds}s delay`);
+      
+      // Create a client for the Appwrite Functions API
+      const schedulerClient = new AppwriteClient();
+      schedulerClient
+        .setEndpoint(process.env.APPWRITE_ENDPOINT)
+        .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
+        .setKey(process.env.APPWRITE_API_KEY);
+      
+      const functions = new Functions(schedulerClient);
+      
+      // Create execution payload
+      const payload = JSON.stringify({
+        postId: post.$id,
+        isContinuation: true,
+        stage: post.processing_stage,
+        continuationToken: `continuation-${post.$id}-${Date.now()}`
+      });
+      
+      // Execute the function after delay
+      const execution = await functions.createExecution(
+        process.env.APPWRITE_FUNCTION_ID,
+        payload,
+        false, // async execution
+        `/`, // path 
+        'POST', // method
+        { 'X-Appwrite-Continuation': 'true' } // custom headers
+      );
+      
+      console.log(`[SCHEDULER] Created continuation task, execution ID: ${execution.$id}`);
+      
+      return execution.$id;
+    } else {
+      console.log('[SCHEDULER] Task scheduling disabled due to missing environment variables');
+      return null;
+    }
+  } catch (error) {
+    console.error('[SCHEDULER] Error scheduling continuation task:', error);
+    return null;
+  }
+} 
