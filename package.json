@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Background audio processing for Sacral Track",
   "main": "src/dist/index.js",
-  "type": "module",
+  "type": "commonjs",
   "scripts": {
     "build": "esbuild src/appwriteFunction.js --bundle --outfile=src/dist/index.js --platform=node --target=node16",
     "old-build": "netlify-lambda build functions -c webpack.functions.js"
