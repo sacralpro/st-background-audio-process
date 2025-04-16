@@ -1315,17 +1315,88 @@ async function scheduleNextStep(client, executionId, postId) {
 
 // Main function
 module.exports = async function(req, res) {
-  // Initialize payload
-  const payload = req.body || {};
+  // Подробное логирование для отладки
+  console.log("=== REQUEST DEBUG INFO ===");
+  console.log("Request type:", typeof req);
+  console.log("Request keys:", req ? Object.keys(req).join(', ') : 'undefined');
+  console.log("Headers:", req.headers ? JSON.stringify(req.headers) : 'undefined');
   
-  // Start client and services
+  // Улучшенное извлечение payload
+  let payload = {};
+  let rawBody = null;
+  
   try {
+    // Логируем сырые данные
+    console.log("Raw body type:", typeof req.body);
+    console.log("Raw body:", req.body);
+    
+    // Вариант 1: req.body строка JSON
+    if (req.body && typeof req.body === 'string') {
+      try {
+        rawBody = req.body;
+        payload = JSON.parse(req.body);
+        console.log("Parsed payload from string:", payload);
+      } catch (e) {
+        console.error("Error parsing body string:", e.message);
+      }
+    }
+    // Вариант 2: req.body уже объект
+    else if (req.body && typeof req.body === 'object') {
+      payload = req.body;
+      console.log("Using body object directly:", payload);
+      
+      // Проверка на специальный формат Appwrite с полем data
+      if (payload.data && typeof payload.data === 'string') {
+        try {
+          const innerData = JSON.parse(payload.data);
+          console.log("Found nested data in payload:", innerData);
+          payload = innerData;
+        } catch (e) {
+          console.error("Error parsing nested data:", e.message);
+        }
+      }
+    }
+    // Вариант 3: req.bodyJson (в некоторых версиях Appwrite)
+    else if (req.bodyJson) {
+      payload = req.bodyJson;
+      console.log("Using bodyJson:", payload);
+    }
+    
+    // Вариант 4: Проверяем req.payload (в некоторых версиях)
+    else if (req.payload) {
+      payload = req.payload;
+      console.log("Using req.payload:", payload);
+    }
+    
+    // Получаем postId из разных возможных мест
+    let postId = null;
+    
+    if (payload.postId) {
+      postId = payload.postId;
+      console.log("PostId from payload:", postId);
+    } 
+    else if (payload.post_id) {
+      postId = payload.post_id;
+      console.log("PostId from payload.post_id:", postId);
+    }
+    else if (payload.id) {
+      postId = payload.id;
+      console.log("PostId from payload.id:", postId);
+    }
+    // Проверка на данные из вебхуков
+    else if (payload.webhook && payload.webhook.payload && payload.webhook.payload.$id) {
+      postId = payload.webhook.payload.$id;
+      console.log("PostId from webhook payload:", postId);
+    }
+    
+    console.log("Final postId to be used:", postId);
+    
+    // Starting audio processing function
     console.log('Starting audio processing function');
     
     // Identify trigger type
     let triggerType = 'direct';
     let executionId = null;
-    let postId = null;
     
     // Check if triggered by schedule
     if (req.headers && req.headers['x-appwrite-trigger'] === 'schedule') {
@@ -1336,7 +1407,7 @@ module.exports = async function(req, res) {
     // Check if triggered by webhook
     else if (payload.webhook) {
       triggerType = 'webhook';
-      console.log('Triggered by webhook');
+      console.log('Webhook event:', payload.webhook);
     }
     
     // Check if continuation of execution
@@ -1349,7 +1420,6 @@ module.exports = async function(req, res) {
     
     // Otherwise assume direct API call
     else {
-      postId = payload.postId;
       console.log(`Direct API call for post ${postId}`);
     }
     
