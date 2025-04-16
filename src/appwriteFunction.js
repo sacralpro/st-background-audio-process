@@ -202,6 +202,12 @@ module.exports = async function(req, res) {
   log(`Request type: ${typeof req}`);
   log(`Request keys: ${req ? Object.keys(req).join(', ') : 'undefined'}`);
   
+  // ВАЖНО: Проверка variables - это ключевая часть для Appwrite Dashboard
+  if (req.variables) {
+    log("Found Appwrite variables:");
+    log(`Variables: ${JSON.stringify(req.variables)}`);
+  }
+  
   // Дополнительное логирование для Appwrite context
   if (req.params) {
     log("Found Appwrite context params");
@@ -211,8 +217,41 @@ module.exports = async function(req, res) {
   // Ulучшенное извлечение payload
   let payload = {};
   
+  // НОВЫЙ КОД: Извлекаем данные из Appwrite Dashboard variables
+  if (req.variables && Object.keys(req.variables).length > 0) {
+    log(`Found variables in request: ${JSON.stringify(req.variables)}`);
+    
+    // Пробуем найти postId в переменных
+    if (req.variables.postId) {
+      payload.postId = req.variables.postId;
+      log(`Found postId in variables: ${payload.postId}`);
+    }
+    // Проверяем, может во variables есть объект data
+    else if (req.variables.data) {
+      try {
+        // Если data строка - парсим
+        if (typeof req.variables.data === 'string') {
+          const parsedData = JSON.parse(req.variables.data);
+          log(`Parsed data from variables: ${JSON.stringify(parsedData)}`);
+          if (parsedData.postId) {
+            payload.postId = parsedData.postId;
+            log(`Found postId in parsed variables.data: ${payload.postId}`);
+          }
+        } 
+        // Если data уже объект
+        else if (typeof req.variables.data === 'object' && req.variables.data !== null) {
+          if (req.variables.data.postId) {
+            payload.postId = req.variables.data.postId;
+            log(`Found postId in variables.data object: ${payload.postId}`);
+          }
+        }
+      } catch (e) {
+        logError(`Failed to parse variables.data: ${e.message}`);
+      }
+    }
+  }
   // ВАЖНО: Извлекаем данные из Appwrite Dashboard параметров
-  if (req.params && req.params.postId) {
+  else if (req.params && req.params.postId) {
     log(`Found direct postId in req.params: ${req.params.postId}`);
     payload.postId = req.params.postId;
   }
@@ -242,6 +281,34 @@ module.exports = async function(req, res) {
     }
   }
   
+  // НОВЫЙ КОД: Проверка req.rawBody и req.bodyRaw
+  // В некоторых версиях Appwrite данные могут быть в этих полях
+  if (!payload.postId && req.rawBody) {
+    try {
+      const parsedRawBody = JSON.parse(req.rawBody);
+      log(`Parsed rawBody: ${JSON.stringify(parsedRawBody)}`);
+      if (parsedRawBody.postId) {
+        payload.postId = parsedRawBody.postId;
+        log(`Found postId in rawBody: ${payload.postId}`);
+      }
+    } catch (e) {
+      logError(`Failed to parse rawBody: ${e.message}`);
+    }
+  }
+  
+  if (!payload.postId && req.bodyRaw) {
+    try {
+      const parsedBodyRaw = JSON.parse(req.bodyRaw);
+      log(`Parsed bodyRaw: ${JSON.stringify(parsedBodyRaw)}`);
+      if (parsedBodyRaw.postId) {
+        payload.postId = parsedBodyRaw.postId;
+        log(`Found postId in bodyRaw: ${payload.postId}`);
+      }
+    } catch (e) {
+      logError(`Failed to parse bodyRaw: ${e.message}`);
+    }
+  }
+  
   // Извлечение postId из разных структур
   let postId = null;
   
@@ -259,6 +326,35 @@ module.exports = async function(req, res) {
     } catch (e) {
       logError(`Failed to parse nested data: ${e.message}`);
     }
+  }
+  
+  // НОВЫЙ КОД: Последняя попытка - ищем везде
+  if (!postId) {
+    // Функция для рекурсивного поиска postId в объекте
+    const findPostIdInObject = (obj, path = '') => {
+      if (!obj || typeof obj !== 'object') return null;
+      
+      // Прямой поиск ключей похожих на postId
+      for (const key of Object.keys(obj)) {
+        if (key.toLowerCase().includes('postid') || key.toLowerCase().includes('post_id')) {
+          log(`Found possible postId at ${path}.${key}: ${obj[key]}`);
+          return obj[key];
+        }
+      }
+      
+      // Рекурсивный поиск
+      for (const key of Object.keys(obj)) {
+        if (typeof obj[key] === 'object' && obj[key] !== null) {
+          const found = findPostIdInObject(obj[key], `${path}.${key}`);
+          if (found) return found;
+        }
+      }
+      
+      return null;
+    };
+    
+    // Ищем postId в req
+    postId = findPostIdInObject(req, 'req');
   }
   
   log(`Final postId to be used: ${postId}`);
