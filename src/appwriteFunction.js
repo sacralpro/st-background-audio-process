@@ -1,16 +1,57 @@
 // Appwrite Function for audio processing
 // Optimized for direct calls from Sacral Track application
 
-import { Client, Databases, Storage, ID } from 'node-appwrite';
-import * as fs from 'fs';
-import * as path from 'path';
-import { promisify } from 'util';
-import ffmpeg from 'fluent-ffmpeg';
-import { Client as AppwriteClient, Functions } from 'node-appwrite';
-import { Query } from 'node-appwrite';
-import * as os from 'os';
-import axios from 'axios';
-import { InputFile } from 'node-appwrite';
+// Заменяем импорты ES модулей на CommonJS синтаксис
+const { Client, Databases, Storage, ID, Query } = require('node-appwrite');
+const axios = require('axios');
+const path = require('path');
+const fs = require('fs');
+const { promisify } = require('util');
+const os = require('os');
+const ffmpeg = require('fluent-ffmpeg');
+const dotenv = require('dotenv');
+
+// Инициализируем dotenv для загрузки переменных окружения из .env файла (если он существует)
+dotenv.config();
+
+// Промисифицируем функции fs для асинхронного использования
+const mkdirAsync = promisify(fs.mkdir);
+const writeFileAsync = promisify(fs.writeFile);
+const readFileAsync = promisify(fs.readFile);
+const unlinkAsync = promisify(fs.unlink);
+const readdirAsync = promisify(fs.readdir);
+const statAsync = promisify(fs.stat);
+
+// Константы для Appwrite
+const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1';
+const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID;
+const APPWRITE_API_KEY = process.env.APPWRITE_API_KEY;
+const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
+const APPWRITE_COLLECTION_ID = process.env.APPWRITE_COLLECTION_ID || 'posts';
+const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
+
+// Добавляем константу для логов, если она будет использоваться
+const APPWRITE_COLLECTION_ID_LOGS = process.env.APPWRITE_COLLECTION_ID_LOGS;
+
+// Определяем константы для шагов обработки
+const PROCESSING_STEPS = {
+  INITIALIZE: 'initialize',
+  DOWNLOAD: 'download',
+  CONVERT: 'convert',
+  SEGMENT: 'segment',
+  UPLOAD_SEGMENTS: 'upload_segments',
+  CREATE_PLAYLIST: 'create_playlist',
+  FINALIZE: 'finalize'
+};
+
+// Инициализация Appwrite SDK
+const client = new Client()
+  .setEndpoint(APPWRITE_ENDPOINT)
+  .setProject(APPWRITE_PROJECT_ID)
+  .setKey(APPWRITE_API_KEY);
+
+const databases = new Databases(client);
+const storage = new Storage(client);
 
 // Защита от ошибок парсинга JSON на самом раннем уровне
 // Monkey patch JSON.parse чтобы предотвратить сбои
@@ -46,15 +87,16 @@ JSON.parse = function safeParse(text, reviver) {
 };
 
 // Tracking execution progress for multi-step processing
-const PROCESSING_STEPS = {
-  INITIALIZE: 'initialize',
-  DOWNLOAD: 'download',
-  CONVERT: 'convert',
-  SEGMENT: 'segment',
-  UPLOAD_SEGMENTS: 'upload_segments',
-  CREATE_PLAYLIST: 'create_playlist',
-  FINALIZE: 'finalize'
-};
+// Удаляем это дублирующееся объявление
+// const PROCESSING_STEPS = {
+//   INITIALIZE: 'initialize',
+//   DOWNLOAD: 'download',
+//   CONVERT: 'convert',
+//   SEGMENT: 'segment',
+//   UPLOAD_SEGMENTS: 'upload_segments',
+//   CREATE_PLAYLIST: 'create_playlist',
+//   FINALIZE: 'finalize'
+// };
 
 // Main entry point for Appwrite Function - Single context parameter format
 async function appwriteFunction(context) {
@@ -206,38 +248,6 @@ async function appwriteFunction(context) {
     log('- Content-Type:', executionRecord.request_info.content_type);
     log('- Trigger:', executionRecord.request_info.trigger);
   }
-  
-  // Promisify fs functions
-  const mkdirAsync = promisify(fs.mkdir);
-  const writeFileAsync = promisify(fs.writeFile);
-  const readFileAsync = promisify(fs.readFile);
-  const unlinkAsync = promisify(fs.unlink);
-  const readdirAsync = promisify(fs.readdir);
-  const statAsync = promisify(fs.stat);
-  const rmdirAsync = promisify(fs.rmdir);
-  const copyFileAsync = promisify(fs.copyFile);
-  
-  // Initialize Appwrite client
-  const client = new Client();
-  
-  // Get environment variables
-  const { 
-    APPWRITE_FUNCTION_PROJECT_ID, 
-    APPWRITE_FUNCTION_API_KEY,
-    APPWRITE_DATABASE_ID,
-    APPWRITE_COLLECTION_ID_POST,
-    APPWRITE_BUCKET_ID,
-    APPWRITE_ENDPOINT 
-  } = process.env;
-  
-  // Connect to Appwrite
-  client
-    .setEndpoint(APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1')
-    .setProject(APPWRITE_FUNCTION_PROJECT_ID)
-    .setKey(APPWRITE_FUNCTION_API_KEY);
-  
-  const databases = new Databases(client);
-  const storage = new Storage(client);
   
   // Initialize payload and postId as empty at the function level to avoid undefined errors
   let payload = {};
@@ -562,7 +572,7 @@ async function appwriteFunction(context) {
     // Get post document
     const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID_POST,
+      APPWRITE_COLLECTION_ID,
       postId
     );
     
@@ -607,7 +617,7 @@ async function appwriteFunction(context) {
       // Just initialize and schedule the first continuation
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
+        APPWRITE_COLLECTION_ID,
         post.$id,
         {
           processing_status: 'processing',
@@ -673,7 +683,7 @@ async function appwriteFunction(context) {
     // Update post status to processing
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID_POST,
+      APPWRITE_COLLECTION_ID,
       post.$id,
       {
         processing_status: 'processing',
@@ -735,7 +745,7 @@ async function appwriteFunction(context) {
         // Immediately update post with MP3 ID to prevent re-uploading on timeout
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
+          APPWRITE_COLLECTION_ID,
           post.$id,
           {
             mp3_file_id: mp3UploadResult.$id,
@@ -757,7 +767,7 @@ async function appwriteFunction(context) {
       // Update progress
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
+        APPWRITE_COLLECTION_ID,
         post.$id,
         {
           processing_progress: 40
@@ -806,7 +816,7 @@ async function appwriteFunction(context) {
       // Update progress
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
+        APPWRITE_COLLECTION_ID,
         post.$id,
         {
           processing_progress: 60
@@ -850,7 +860,7 @@ async function appwriteFunction(context) {
       // Update progress
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
+        APPWRITE_COLLECTION_ID,
         post.$id,
         {
           processing_progress: 80
@@ -899,7 +909,7 @@ async function appwriteFunction(context) {
       // Update post with processed audio
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
+        APPWRITE_COLLECTION_ID,
         post.$id,
         {
           mp3_file_id: mp3UploadResult.$id,
@@ -973,7 +983,7 @@ async function appwriteFunction(context) {
               if (post && post.$id) {
                 await databases.updateDocument(
                   APPWRITE_DATABASE_ID,
-                  APPWRITE_COLLECTION_ID_POST,
+                  APPWRITE_COLLECTION_ID,
                   post.$id,
                   {
                     last_execution_info: JSON.stringify({
@@ -1001,7 +1011,7 @@ async function appwriteFunction(context) {
       if (safePostId) {
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
+          APPWRITE_COLLECTION_ID,
           safePostId,
           {
             processing_status: 'completed',
@@ -1026,7 +1036,7 @@ async function appwriteFunction(context) {
         // Schedule a follow-up by setting a special status
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
+          APPWRITE_COLLECTION_ID,
           post.$id,
           {
             processing_status: 'processing',
@@ -1105,7 +1115,7 @@ async function appwriteFunction(context) {
                 if (post && post.$id) {
                   await databases.updateDocument(
                     APPWRITE_DATABASE_ID,
-                    APPWRITE_COLLECTION_ID_POST,
+                    APPWRITE_COLLECTION_ID,
                     post.$id,
                     {
                       last_execution_info: JSON.stringify({
@@ -1133,7 +1143,7 @@ async function appwriteFunction(context) {
         if (safePostId) {
           await databases.updateDocument(
             APPWRITE_DATABASE_ID,
-            APPWRITE_COLLECTION_ID_POST,
+            APPWRITE_COLLECTION_ID,
             safePostId,
             {
               processing_status: 'failed',
@@ -1208,7 +1218,7 @@ async function appwriteFunction(context) {
               if (post && post.$id) {
                 await databases.updateDocument(
                   APPWRITE_DATABASE_ID,
-                  APPWRITE_COLLECTION_ID_POST,
+                  APPWRITE_COLLECTION_ID,
                   post.$id,
                   {
                     last_execution_info: JSON.stringify({
@@ -1236,7 +1246,7 @@ async function appwriteFunction(context) {
       if (safePostId) {
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
+          APPWRITE_COLLECTION_ID,
           safePostId,
           {
             processing_status: 'failed',
@@ -2434,16 +2444,7 @@ async function shouldStartNewExecution(postId, databases) {
 
 // Main audio processing function, now with step-based processing
 async function processAudio(postId, databases, storage, client, executionId = null) {
-  // Define processing steps
-  const PROCESSING_STEPS = {
-    INITIALIZE: 'initialize',
-    DOWNLOAD: 'download',
-    CONVERT: 'convert',
-    SEGMENT: 'segment',
-    UPLOAD_SEGMENTS: 'upload_segments',
-    CREATE_PLAYLIST: 'create_playlist',
-    FINALIZE: 'finalize'
-  };
+  // Используем уже определенную переменную PROCESSING_STEPS, которая объявлена в начале файла
   
   // Start timing
   const startTime = Date.now();
