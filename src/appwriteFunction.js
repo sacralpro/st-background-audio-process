@@ -171,15 +171,29 @@ module.exports = async function(req, res) {
   // Инициализируем объект payload заранее
   let payload = {};
   
-  // Правильно определяем функции логирования
-  const log = req.log || console.log;
-  const error = req.error || console.error;
+  // Правильно определяем функции логирования в соответствии с Appwrite
+  const log = (typeof req.log === 'function') ? req.log : console.log;
+  const error = (typeof req.error === 'function') ? req.error : console.error;
   
   log('Запуск функции обработки аудио');
   
   try {
     // Логируем все доступные ключи для отладки
     log(`Available keys in req: ${Object.keys(req).join(', ')}`);
+    
+    // Проверяем, имеем ли мы дело с объектом context вместо req/res
+    const isContextPattern = !!(req.req && req.res);
+    if (isContextPattern) {
+      log('Detected context pattern, adapting request and response objects');
+      // Если мы получили объект context вместо req/res
+      const context = req;
+      req = context.req || {};
+      res = context.res || {};
+      
+      // Обновляем функции логов
+      if (typeof context.log === 'function') log = context.log;
+      if (typeof context.error === 'function') error = context.error;
+    }
     
     // Безопасная инициализация payload из разных источников
     if (req.body) {
@@ -217,6 +231,23 @@ module.exports = async function(req, res) {
       }
     }
     
+    // Проверяем функцию APPWRITE_FUNCTION_DATA
+    if (req.variables && req.variables.APPWRITE_FUNCTION_DATA) {
+      try {
+        const functionData = req.variables.APPWRITE_FUNCTION_DATA;
+        log(`Found APPWRITE_FUNCTION_DATA: ${functionData}`);
+        if (typeof functionData === 'string') {
+          Object.assign(payload, JSON.parse(functionData));
+          log('Parsed APPWRITE_FUNCTION_DATA as JSON');
+        } else if (typeof functionData === 'object') {
+          Object.assign(payload, functionData);
+          log('Assigned APPWRITE_FUNCTION_DATA as object');
+        }
+      } catch (e) {
+        error(`Error parsing APPWRITE_FUNCTION_DATA: ${e.message}`);
+      }
+    }
+    
     // Логируем ключи payload для отладки
     log(`Payload keys: ${Object.keys(payload).join(', ')}`);
     
@@ -229,19 +260,40 @@ module.exports = async function(req, res) {
       postId = extractPostId(req, log, error);
     }
     
-    // Проверяем наличие postId перед продолжением
+    // Для тестирования - используем тестовый postId если ничего не найдено
     if (!postId) {
-      log('postId not found in request');
-      
-      // Проверяем res перед использованием
-      if (res && typeof res.json === 'function') {
-        return res.json({
-          success: false,
-          message: 'Post ID is required but was not found in the request'
-        });
+      // Если мы в режиме разработки или тестирования, используем тестовый postId
+      const isDevEnvironment = process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'test';
+      if (isDevEnvironment) {
+        postId = '67ff89bb2ba219fbfac8'; // Тестовый ID для разработки
+        log(`Using test postId for development: ${postId}`);
       } else {
-        error('res.json is not available');
-        throw new Error('Post ID is required but was not found in the request');
+        log('postId not found in request');
+        
+        // Возвращаем ответ, используя правильный способ в зависимости от шаблона
+        if (isContextPattern) {
+          return res.json({
+            success: false,
+            message: 'Post ID is required but was not found in the request'
+          });
+        } else {
+          // Стандартный подход для Node.js HTTP ответа
+          if (res && typeof res.setHeader === 'function' && typeof res.end === 'function') {
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({
+              success: false,
+              message: 'Post ID is required but was not found in the request'
+            }));
+            return;
+          } else {
+            // Если мы не можем отправить ответ, логируем ошибку и возвращаем объект
+            error('Unable to send response: res object does not have required methods');
+            return {
+              success: false,
+              message: 'Post ID is required but was not found in the request'
+            };
+          }
+        }
       }
     }
     
@@ -270,91 +322,32 @@ module.exports = async function(req, res) {
     const databases = new sdk.Databases(client);
     const storage = new sdk.Storage(client);
     
-    // Получаем информацию о посте
+    // Начинаем обработку аудио
     try {
-      log(`Fetching post with ID: ${postId}`);
-      const post = await databases.getDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID,
-        postId
-      );
-      
-      log(`Post found: ${post.$id}`);
-      
-      // Обрабатываем пост
-      let audioUrl = post.audioUrl;
-      
-      if (!audioUrl) {
-        logError(`No audioUrl found in post: ${postId}`);
-        if (res && typeof res.json === 'function') {
-          return res.json({
-            success: false,
-            message: 'No audioUrl found in post'
-          });
-        } else {
-          return { success: false, message: 'No audioUrl found in post' };
-        }
-      }
-      
-      log(`Starting audio processing for URL: ${audioUrl}`);
-      
-      // Здесь ваш код для обработки аудио
-      // ...
-      
-      // Вернем успешный ответ
-      if (res && typeof res.json === 'function') {
-        return res.json({
-          success: true,
-          message: 'Audio processing started',
-          postId: postId
-        });
-      } else {
-        return { 
-          success: true, 
-          message: 'Audio processing started', 
-          postId: postId 
-        };
-      }
-    } catch (error) {
-      logError(`Error processing post ${postId}: ${error.message}`);
-      logError(error.stack);
-      
-      // Безопасный ответ в случае ошибки
-      if (res && typeof res.json === 'function') {
-        return res.json({
-          success: false,
-          message: `Error processing post: ${error.message}`,
-          postId: postId
-        });
-      } else {
-        return { 
-          success: false, 
-          message: `Error processing post: ${error.message}`, 
-          postId: postId 
-        };
-      }
+      const result = await processAudio(postId, databases, storage, client);
+      return safeJsonResponse(res, {
+        success: true,
+        message: 'Audio processing started',
+        postId: postId,
+        result: result
+      }, isContextPattern, log, error);
+    } catch (processError) {
+      error(`Error processing audio: ${processError.message}`);
+      error(processError.stack);
+      return safeJsonResponse(res, {
+        success: false,
+        message: `Error processing audio: ${processError.message}`,
+        postId: postId
+      }, isContextPattern, log, error);
     }
-  } catch (error) {
-    // Обработка общих ошибок
-    const logError = (req.error && typeof req.error === 'function') 
-      ? req.error 
-      : console.error;
-    
-    logError(`Unexpected error: ${error.message}`);
-    logError(error.stack);
-    
-    // Безопасный ответ в случае ошибки
-    if (res && typeof res.json === 'function') {
-      return res.json({ 
-        success: false, 
-        error: `Unexpected error: ${error.message}` 
-      });
-    } else {
-      return { 
-        success: false, 
-        error: `Unexpected error: ${error.message}` 
-      };
-    }
+  } catch (err) {
+    error(`Unexpected error in main function: ${err.message}`);
+    error(err.stack);
+    return safeJsonResponse(res, {
+      success: false,
+      message: 'Unexpected error in audio processing',
+      error: err.message
+    }, isContextPattern, log, error);
   }
 };
 
@@ -1622,4 +1615,23 @@ async function processAudio(postId, databases, storage, client, executionId = nu
       executionId: executionRecord.$id
     };
   }
+}
+
+// Вспомогательная функция для безопасной отправки JSON-ответа
+function safeJsonResponse(res, data, isContextPattern, log, error) {
+  // Если используется шаблон с контекстом (context.res)
+  if (isContextPattern) {
+    return res.json(data);
+  }
+  
+  // Для стандартного Node.js HTTP ответа
+  if (res && typeof res.setHeader === 'function' && typeof res.end === 'function') {
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify(data));
+    return;
+  }
+  
+  // Если мы не можем отправить ответ, логируем ошибку и возвращаем объект
+  error('Unable to send response: res object does not have required methods');
+  return data;
 }
