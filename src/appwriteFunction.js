@@ -96,16 +96,51 @@ function extractPostId(req, log, logError) {
     return req.postId;
   }
   
+  // Проверяем id или $id в req
+  if (req.id) {
+    log(`Found id in req: ${req.id}`);
+    return req.id;
+  }
+  
+  if (req.$id) {
+    log(`Found $id in req: ${req.$id}`);
+    return req.$id;
+  }
+  
   // Проверяем параметры запроса
   if (req.params && req.params.postId) {
     log(`Found postId in req.params: ${req.params.postId}`);
     return req.params.postId;
+  }
+  
+  // Проверяем параметры id или $id в params
+  if (req.params) {
+    if (req.params.id) {
+      log(`Found id in req.params: ${req.params.id}`);
+      return req.params.id;
+    }
+    if (req.params.$id) {
+      log(`Found $id in req.params: ${req.params.$id}`);
+      return req.params.$id;
+    }
   }
 
   // Проверяем переменные
   if (req.variables && req.variables.postId) {
     log(`Found postId in req.variables: ${req.variables.postId}`);
     return req.variables.postId;
+  }
+  
+  // Проверяем переменные id или $id
+  if (req.variables) {
+    if (req.variables.id) {
+      log(`Found id in req.variables: ${req.variables.id}`);
+      return req.variables.id;
+    }
+    if (req.variables.$id) {
+      log(`Found $id in req.variables: ${req.variables.$id}`);
+      return req.variables.$id;
+    }
   }
   
   // Проверяем путь в URL
@@ -127,22 +162,56 @@ function extractPostId(req, log, logError) {
     // Добавляем текущий объект в посещенные
     visited.add(obj);
     
-    // Прямой поиск
+    // Прямой поиск для всех возможных идентификаторов
     if (obj.postId) {
       log(`Found postId at ${path}.postId: ${obj.postId}`);
       return obj.postId;
     }
     
+    if (obj.id) {
+      log(`Found id at ${path}.id: ${obj.id}`);
+      return obj.id;
+    }
+    
+    if (obj.$id) {
+      log(`Found $id at ${path}.$id: ${obj.$id}`);
+      return obj.$id;
+    }
+    
     // Поиск в data
-    if (obj.data && obj.data.postId && !visited.has(obj.data)) {
-      log(`Found postId at ${path}.data.postId: ${obj.data.postId}`);
-      return obj.data.postId;
+    if (obj.data && !visited.has(obj.data)) {
+      if (obj.data.postId) {
+        log(`Found postId at ${path}.data.postId: ${obj.data.postId}`);
+        return obj.data.postId;
+      }
+      
+      if (obj.data.id) {
+        log(`Found id at ${path}.data.id: ${obj.data.id}`);
+        return obj.data.id;
+      }
+      
+      if (obj.data.$id) {
+        log(`Found $id at ${path}.data.$id: ${obj.data.$id}`);
+        return obj.data.$id;
+      }
     }
     
     // Поиск в event
-    if (obj.event && obj.event.postId && !visited.has(obj.event)) {
-      log(`Found postId at ${path}.event.postId: ${obj.event.postId}`);
-      return obj.event.postId;
+    if (obj.event && !visited.has(obj.event)) {
+      if (obj.event.postId) {
+        log(`Found postId at ${path}.event.postId: ${obj.event.postId}`);
+        return obj.event.postId;
+      }
+      
+      if (obj.event.id) {
+        log(`Found id at ${path}.event.id: ${obj.event.id}`);
+        return obj.event.id;
+      }
+      
+      if (obj.event.$id) {
+        log(`Found $id at ${path}.event.$id: ${obj.event.$id}`);
+        return obj.event.$id;
+      }
     }
     
     // Не углубляемся слишком далеко
@@ -256,7 +325,18 @@ module.exports = async function(req, res) {
     // Получаем postId из payload или с помощью функции извлечения
     let postId = payload.postId;
     
-    // Если postId не найден в payload, используем функцию извлечения
+    // Если postId не найден, пробуем использовать альтернативные поля id или $id
+    if (!postId && payload.id) {
+      postId = payload.id;
+      log(`Using payload.id as postId: ${postId}`);
+    }
+
+    if (!postId && payload.$id) {
+      postId = payload.$id;
+      log(`Using payload.$id as postId: ${postId}`);
+    }
+    
+    // Если postId все еще не найден в payload, используем функцию извлечения
     if (!postId) {
       log('postId not found in payload, trying to extract from request');
       postId = extractPostId(req, log, error);
