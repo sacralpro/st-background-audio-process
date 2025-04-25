@@ -86,17 +86,85 @@ JSON.parse = function safeParse(text, reviver) {
   }
 };
 
-// Tracking execution progress for multi-step processing
-// Удаляем это дублирующееся объявление
-// const PROCESSING_STEPS = {
-//   INITIALIZE: 'initialize',
-//   DOWNLOAD: 'download',
-//   CONVERT: 'convert',
-//   SEGMENT: 'segment',
-//   UPLOAD_SEGMENTS: 'upload_segments',
-//   CREATE_PLAYLIST: 'create_playlist',
-//   FINALIZE: 'finalize'
-// };
+// Помощник для извлечения postId из различных источников
+function extractPostId(req, log, logError) {
+  // Проверяем прямые свойства req
+  if (req.postId) {
+    log(`Found postId directly in req: ${req.postId}`);
+    return req.postId;
+  }
+  
+  // Проверяем параметры запроса
+  if (req.params && req.params.postId) {
+    log(`Found postId in req.params: ${req.params.postId}`);
+    return req.params.postId;
+  }
+
+  // Проверяем переменные
+  if (req.variables && req.variables.postId) {
+    log(`Found postId in req.variables: ${req.variables.postId}`);
+    return req.variables.postId;
+  }
+  
+  // Проверяем путь в URL
+  if (req.url) {
+    const urlMatch = req.url.match(/\/posts\/([^\/\?]+)/);
+    if (urlMatch && urlMatch[1]) {
+      log(`Found postId in URL path: ${urlMatch[1]}`);
+      return urlMatch[1];
+    }
+  }
+  
+  // Рекурсивный поиск в объекте с защитой от бесконечной рекурсии
+  function findPostIdInObject(obj, path = '', visited = new Set()) {
+    // Защита от циклических ссылок
+    if (!obj || typeof obj !== 'object' || visited.has(obj)) {
+      return null;
+    }
+    
+    // Добавляем текущий объект в посещенные
+    visited.add(obj);
+    
+    // Прямой поиск
+    if (obj.postId) {
+      log(`Found postId at ${path}.postId: ${obj.postId}`);
+      return obj.postId;
+    }
+    
+    // Поиск в data
+    if (obj.data && obj.data.postId && !visited.has(obj.data)) {
+      log(`Found postId at ${path}.data.postId: ${obj.data.postId}`);
+      return obj.data.postId;
+    }
+    
+    // Поиск в event
+    if (obj.event && obj.event.postId && !visited.has(obj.event)) {
+      log(`Found postId at ${path}.event.postId: ${obj.event.postId}`);
+      return obj.event.postId;
+    }
+    
+    // Не углубляемся слишком далеко
+    if (path.split('.').length > 4) return null;
+    
+    // Рекурсивный поиск в свойствах
+    for (const key in obj) {
+      // Пропускаем ключи, которые могут вызвать циклические ссылки
+      if (key === 'req' || key === 'res' || key === 'parent') {
+        continue;
+      }
+      
+      if (typeof obj[key] === 'object' && obj[key] !== null) {
+        const result = findPostIdInObject(obj[key], path ? `${path}.${key}` : key, visited);
+        if (result) return result;
+      }
+    }
+    
+    return null;
+  }
+  
+  // Запускаем рекурсивный поиск
+  return findPostIdInObject(req);
+}
 
 // Main entry point for Appwrite Function - Single context parameter format
 async function appwriteFunction(context) {
@@ -119,6 +187,29 @@ async function appwriteFunction(context) {
   // Извлекаем параметры из bodyJson в контексте Appwrite
   let postId = null;
   let payload = {};
+  
+  // === REQUEST DEBUG INFO ===
+  log("=== REQUEST DEBUG INFO ===");
+  log(`Request type: ${typeof context}`);
+  if (context && context.req) {
+    log(`Request keys: ${Object.keys(context.req).join(', ')}`);
+  }
+  
+  // Создаем безопасную копию объекта req без циклических ссылок
+  const safeReq = {};
+  if (context.req) {
+    // Копируем только необходимые свойства, избегая дублирования
+    if (context.req.body) {
+      safeReq.body = context.req.body;
+    }
+    if (context.req.headers) {
+      safeReq.headers = context.req.headers;
+    }
+    if (context.req.params) {
+      safeReq.params = context.req.params;
+    }
+    // Другие необходимые свойства
+  }
   
   // Извлечение из разных мест контекста
   if (context.req) {
@@ -168,7 +259,9 @@ async function appwriteFunction(context) {
     log(`Processing post with ID: ${postId}`);
     return await module.exports({
       body: { postId },
-      headers: context.req ? context.req.headers : {}
+      headers: context.req ? context.req.headers : {},
+      log: log,
+      error: logError
     }, context.res || { json: (data) => data });
   } else {
     logError('No postId found in request');
@@ -180,269 +273,202 @@ async function appwriteFunction(context) {
 
 // Main function
 module.exports = async function(req, res) {
-  // Создаем логеры, если они есть в контексте
-  const log = (msg) => {
-    if (typeof req.log === 'function') {
-      req.log(msg);
-    } else {
-      console.log(msg);
+  // Enhanced logging for debugging
+  console.log(`Request received with keys: ${Object.keys(req).join(', ')}`);
+  
+  // Предотвращаем циклические ссылки
+  let safeReq = {};
+  try {
+    // Копируем только необходимые поля из req
+    if (req) {
+      if (req.body) safeReq.body = req.body;
+      if (req.headers) safeReq.headers = req.headers;
+      if (req.params) safeReq.params = req.params;
+      if (req.log) safeReq.log = req.log;
+      if (req.error) safeReq.error = req.error;
     }
-  };
-  
-  const logError = (msg) => {
-    if (typeof req.error === 'function') {
-      req.error(msg);
-    } else {
-      console.error(msg);
-    }
-  };
-  
-  // Подробное логирование для отладки
-  log("=== REQUEST DEBUG INFO ===");
-  log(`Request type: ${typeof req}`);
-  log(`Request keys: ${req ? Object.keys(req).join(', ') : 'undefined'}`);
-  
-  // ВАЖНО: Проверка variables - это ключевая часть для Appwrite Dashboard
-  if (req.variables) {
-    log("Found Appwrite variables:");
-    log(`Variables: ${JSON.stringify(req.variables)}`);
+  } catch (e) {
+    console.error("Error while creating safe req object:", e);
   }
   
-  // Дополнительное логирование для Appwrite context
-  if (req.params) {
-    log("Found Appwrite context params");
-    log(`Params: ${JSON.stringify(req.params)}`);
-  }
-  
-  // Ulучшенное извлечение payload
+  // Initialize payload as an empty object
   let payload = {};
   
-  // НОВЫЙ КОД: Извлекаем данные из Appwrite Dashboard variables
-  if (req.variables && Object.keys(req.variables).length > 0) {
-    log(`Found variables in request: ${JSON.stringify(req.variables)}`);
-    
-    // Пробуем найти postId в переменных
-    if (req.variables.postId) {
-      payload.postId = req.variables.postId;
-      log(`Found postId in variables: ${payload.postId}`);
-    }
-    // Проверяем, может во variables есть объект data
-    else if (req.variables.data) {
-      try {
-        // Если data строка - парсим
-        if (typeof req.variables.data === 'string') {
-          const parsedData = JSON.parse(req.variables.data);
-          log(`Parsed data from variables: ${JSON.stringify(parsedData)}`);
-          if (parsedData.postId) {
-            payload.postId = parsedData.postId;
-            log(`Found postId in parsed variables.data: ${payload.postId}`);
-          }
-        } 
-        // Если data уже объект
-        else if (typeof req.variables.data === 'object' && req.variables.data !== null) {
-          if (req.variables.data.postId) {
-            payload.postId = req.variables.data.postId;
-            log(`Found postId in variables.data object: ${payload.postId}`);
-          }
-        }
-      } catch (e) {
-        logError(`Failed to parse variables.data: ${e.message}`);
-      }
-    }
-  }
-  // ВАЖНО: Извлекаем данные из Appwrite Dashboard параметров
-  else if (req.params && req.params.postId) {
-    log(`Found direct postId in req.params: ${req.params.postId}`);
-    payload.postId = req.params.postId;
-  }
-  else if (req.params && typeof req.params === 'string') {
-    try {
-      const parsedParams = JSON.parse(req.params);
-      log(`Parsed params string: ${JSON.stringify(parsedParams)}`);
-      if (parsedParams.postId) {
-        payload.postId = parsedParams.postId;
-      }
-    } catch (e) {
-      logError(`Failed to parse params: ${e.message}`);
-    }
-  }
-  // Стандартное извлечение из body
-  else if (req.body) {
-    if (typeof req.body === 'string') {
-      try {
-        payload = JSON.parse(req.body);
-        log(`Parsed body string: ${JSON.stringify(payload)}`);
-      } catch (e) {
-        logError(`Failed to parse body: ${e.message}`);
-      }
-    } else if (typeof req.body === 'object') {
-      payload = req.body;
-      log(`Using body object: ${JSON.stringify(payload)}`);
-    }
-  }
-  
-  // НОВЫЙ КОД: Проверка req.rawBody и req.bodyRaw
-  // В некоторых версиях Appwrite данные могут быть в этих полях
-  if (!payload.postId && req.rawBody) {
-    try {
-      const parsedRawBody = JSON.parse(req.rawBody);
-      log(`Parsed rawBody: ${JSON.stringify(parsedRawBody)}`);
-      if (parsedRawBody.postId) {
-        payload.postId = parsedRawBody.postId;
-        log(`Found postId in rawBody: ${payload.postId}`);
-      }
-    } catch (e) {
-      logError(`Failed to parse rawBody: ${e.message}`);
-    }
-  }
-  
-  if (!payload.postId && req.bodyRaw) {
-    try {
-      const parsedBodyRaw = JSON.parse(req.bodyRaw);
-      log(`Parsed bodyRaw: ${JSON.stringify(parsedBodyRaw)}`);
-      if (parsedBodyRaw.postId) {
-        payload.postId = parsedBodyRaw.postId;
-        log(`Found postId in bodyRaw: ${payload.postId}`);
-      }
-    } catch (e) {
-      logError(`Failed to parse bodyRaw: ${e.message}`);
-    }
-  }
-  
-  // Извлечение postId из разных структур
-  let postId = null;
-  
-  if (payload.postId) {
-    postId = payload.postId;
-    log(`Found postId in payload: ${postId}`);
-  } 
-  else if (payload.data && typeof payload.data === 'string') {
-    try {
-      const parsedData = JSON.parse(payload.data);
-      log(`Parsed nested data: ${JSON.stringify(parsedData)}`);
-      if (parsedData.postId) {
-        postId = parsedData.postId;
-      }
-    } catch (e) {
-      logError(`Failed to parse nested data: ${e.message}`);
-    }
-  }
-  
-  // НОВЫЙ КОД: Последняя попытка - ищем везде
-  if (!postId) {
-    // Функция для рекурсивного поиска postId в объекте
-    const findPostIdInObject = (obj, path = '') => {
-      if (!obj || typeof obj !== 'object') return null;
-      
-      // Прямой поиск ключей похожих на postId
-      for (const key of Object.keys(obj)) {
-        if (key.toLowerCase().includes('postid') || key.toLowerCase().includes('post_id')) {
-          log(`Found possible postId at ${path}.${key}: ${obj[key]}`);
-          return obj[key];
-        }
-      }
-      
-      // Рекурсивный поиск
-      for (const key of Object.keys(obj)) {
-        if (typeof obj[key] === 'object' && obj[key] !== null) {
-          const found = findPostIdInObject(obj[key], `${path}.${key}`);
-          if (found) return found;
-        }
-      }
-      
-      return null;
-    };
-    
-    // Ищем postId в req
-    postId = findPostIdInObject(req, 'req');
-  }
-  
-  log(`Final postId to be used: ${postId}`);
-  
-  // Start client and services
   try {
-    log('Starting audio processing function');
+    // Используем context.log если доступен, иначе console.log
+    const log = (req.log && typeof req.log === 'function') ? req.log : console.log;
+    const logError = (req.error && typeof req.error === 'function') ? req.error : console.error;
     
-    // Identify trigger type
-    let triggerType = 'direct';
-    let executionId = null;
-    
-    // Process based on trigger type
-    let result = null;
-    
-    if (triggerType === 'schedule') {
-      // Process unprocessed posts
-      result = await processUnprocessedPosts(databases, storage, client);
-    }
-    else if (triggerType === 'webhook') {
-      try {
-        // Get post ID from webhook
-        const event = payload.webhook;
-        log('Webhook event:', event);
-        
-        // Check if it's a database event and has valid post ID
-        if (event.event && event.event.includes('databases') && event.payload && event.payload.$id) {
-          // Process the post
-          postId = event.payload.$id;
-          result = await processAudio(postId, databases, storage, client);
-        } else {
-          logError('Invalid webhook event:', event);
-          result = { success: false, message: 'Invalid webhook event' };
+    // Извлекаем payload из req.body (если доступен)
+    if (req.body) {
+      log('Request body available, attempting to parse');
+      if (typeof req.body === 'string') {
+        try {
+          payload = JSON.parse(req.body);
+          log('Successfully parsed JSON from req.body string');
+        } catch (e) {
+          logError(`Error parsing JSON from body: ${e.message}`);
+          payload = { rawBody: req.body };
         }
-      } catch (webhookError) {
-        logError('Error processing webhook:', webhookError);
-        result = { success: false, message: `Error processing webhook: ${webhookError.message}` };
+      } else if (typeof req.body === 'object') {
+        log('Using req.body object directly');
+        payload = req.body;
       }
-    }
-    else if (triggerType === 'continuation') {
-      // Continue processing the post
-      result = await processAudio(postId, databases, storage, client, executionId);
+    } else {
+      log('req.body is empty or undefined');
       
-      // Schedule next step if needed
-      if (result.success && result.currentStep) {
-        await scheduleNextStep(client, result.executionId, result.postId);
-        log(`Scheduled next step: ${result.currentStep}`);
+      // Проверяем альтернативные источники payload
+      if (req.rawBody || req.bodyRaw) {
+        const rawBody = req.rawBody || req.bodyRaw;
+        log('Found rawBody, attempting to parse');
+        try {
+          payload = JSON.parse(rawBody);
+          log('Successfully parsed JSON from rawBody');
+        } catch (e) {
+          logError(`Error parsing JSON from rawBody: ${e.message}`);
+          payload = { rawBody };
+        }
       }
-    }
-    else if (postId) {
-      // Direct API call with post ID
-      result = await processAudio(postId, databases, storage, client);
-      
-      // Schedule next step if needed
-      if (result.success && result.currentStep) {
-        await scheduleNextStep(client, result.executionId, result.postId);
-        log(`Scheduled next step: ${result.currentStep}`);
-      }
-    }
-    else {
-      logError('No post ID provided');
-      result = { success: false, message: 'No post ID provided' };
     }
     
-    // Send response if available
-    if (res && typeof res.json === 'function') {
-      log('Sending response:', result);
-      return res.json(result);
+    log(`Payload keys: ${Object.keys(payload).join(', ') || 'none'}`);
+    
+    // Извлекаем postId, используя нашу вспомогательную функцию
+    let postId = null;
+    
+    // Сначала проверяем payload
+    if (payload && payload.postId) {
+      postId = payload.postId;
+      log(`Found postId in payload: ${postId}`);
+    } else {
+      // Если не нашли в payload, используем вспомогательную функцию
+      postId = extractPostId(safeReq, log, logError);
+      
+      if (!postId) {
+        log('No postId found in the request');
+        
+        // Безопасный ответ
+        if (res && typeof res.json === 'function') {
+          return res.json({
+            success: false,
+            message: 'No postId found in request'
+          });
+        } else {
+          return { success: false, message: 'No postId found in request' };
+        }
+      }
     }
     
-    return result;
+    log(`Processing postId: ${postId}`);
+    
+    // Добавим информацию о клиенте Appwrite
+    const sdk = require('node-appwrite');
+    
+    // Инициализация клиента в начале функции
+    const client = new sdk.Client();
+    
+    const { 
+      APPWRITE_FUNCTION_PROJECT_ID,
+      APPWRITE_API_KEY,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID,
+      APPWRITE_BUCKET_ID,
+      APPWRITE_ENDPOINT
+    } = process.env;
+
+    client
+      .setEndpoint(APPWRITE_ENDPOINT)
+      .setProject(APPWRITE_FUNCTION_PROJECT_ID)
+      .setKey(APPWRITE_API_KEY);
+    
+    const databases = new sdk.Databases(client);
+    const storage = new sdk.Storage(client);
+    
+    // Получаем информацию о посте
+    try {
+      log(`Fetching post with ID: ${postId}`);
+      const post = await databases.getDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID,
+        postId
+      );
+      
+      log(`Post found: ${post.$id}`);
+      
+      // Обрабатываем пост
+      let audioUrl = post.audioUrl;
+      
+      if (!audioUrl) {
+        logError(`No audioUrl found in post: ${postId}`);
+        if (res && typeof res.json === 'function') {
+          return res.json({
+            success: false,
+            message: 'No audioUrl found in post'
+          });
+        } else {
+          return { success: false, message: 'No audioUrl found in post' };
+        }
+      }
+      
+      log(`Starting audio processing for URL: ${audioUrl}`);
+      
+      // Здесь ваш код для обработки аудио
+      // ...
+      
+      // Вернем успешный ответ
+      if (res && typeof res.json === 'function') {
+        return res.json({
+          success: true,
+          message: 'Audio processing started',
+          postId: postId
+        });
+      } else {
+        return { 
+          success: true, 
+          message: 'Audio processing started', 
+          postId: postId 
+        };
+      }
+    } catch (error) {
+      logError(`Error processing post ${postId}: ${error.message}`);
+      logError(error.stack);
+      
+      // Безопасный ответ в случае ошибки
+      if (res && typeof res.json === 'function') {
+        return res.json({
+          success: false,
+          message: `Error processing post: ${error.message}`,
+          postId: postId
+        });
+      } else {
+        return { 
+          success: false, 
+          message: `Error processing post: ${error.message}`, 
+          postId: postId 
+        };
+      }
+    }
   } catch (error) {
-    logError(`Error in audio processing function: ${error.message}`);
+    // Обработка общих ошибок
+    const logError = (req.error && typeof req.error === 'function') 
+      ? req.error 
+      : console.error;
     
-    // Send error response if available
+    logError(`Unexpected error: ${error.message}`);
+    logError(error.stack);
+    
+    // Безопасный ответ в случае ошибки
     if (res && typeof res.json === 'function') {
-      return res.json({
-        success: false,
-        message: `Error in audio processing function: ${error.message}`,
-        postId: postId
+      return res.json({ 
+        success: false, 
+        error: `Unexpected error: ${error.message}` 
       });
+    } else {
+      return { 
+        success: false, 
+        error: `Unexpected error: ${error.message}` 
+      };
     }
-    
-    return {
-      success: false,
-      message: `Error in audio processing function: ${error.message}`,
-      postId: postId
-    };
   }
 };
 

@@ -179,4 +179,83 @@ APPWRITE_BUCKET_ID=67f2239600384003fd78
 
 ---
 
-Разработано Sacral Projects © 2025 
+Разработано Sacral Projects © 2025
+
+# Тестирование Appwrite функции обработки аудио
+
+Это руководство описывает способы тестирования функции обработки аудио в Appwrite.
+
+## Подготовка к тестированию
+
+1. Убедитесь, что у вас установлены все зависимости:
+
+```bash
+npm install
+```
+
+2. Создайте файл `.env` на основе `.env.example` и заполните его вашими данными:
+
+```bash
+cp .env.example .env
+```
+
+3. Отредактируйте файл `.env`, добавив свои значения для подключения к Appwrite.
+
+## Способы тестирования
+
+### 1. Локальное тестирование (без деплоя)
+
+Этот метод позволяет тестировать функцию локально перед загрузкой в Appwrite:
+
+```bash
+node test-local.js
+```
+
+### 2. Тестирование через Appwrite API
+
+После деплоя вашей функции в Appwrite, вы можете тестировать ее через API:
+
+```bash
+# Добавьте APPWRITE_FUNCTION_ID и TEST_POST_ID в ваш .env файл
+node test-api.js
+```
+
+### 3. Тестирование с помощью Appwrite CLI
+
+Установите Appwrite CLI и используйте его для тестирования:
+
+```bash
+npm install -g appwrite-cli
+appwrite login
+appwrite functions createExecution --functionId=[ID_ФУНКЦИИ] --data='{"postId":"[ID_ПОСТА]"}'
+```
+
+### 4. Тестирование через Appwrite Console
+
+1. Войдите в [Appwrite Console](https://cloud.appwrite.io/console)
+2. Перейдите в раздел Functions
+3. Выберите вашу функцию
+4. Нажмите кнопку "Execute Now"
+5. Введите данные для тестирования в JSON формате:
+   ```json
+   {
+     "postId": "ваш_идентификатор_поста"
+   }
+   ```
+6. Нажмите "Execute" и проверьте результаты выполнения
+
+## Проверка результатов
+
+После выполнения функции проверьте:
+
+1. Обновление документа в коллекции Posts
+2. Наличие созданных файлов аудио-сегментов в Bucket
+3. Генерацию плейлиста
+4. Правильность статусов обработки
+
+## Отладка
+
+Для отладки используйте логи:
+
+1. Через Appwrite Console: Functions > Ваша функция > Executions > Выберите конкретное выполнение > Logs
+2. Через CLI: `appwrite functions listExecutions --functionId=[ID_ФУНКЦИИ]` и затем `appwrite functions getExecution --functionId=[ID_ФУНКЦИИ] --executionId=[ID_ВЫПОЛНЕНИЯ]` 
