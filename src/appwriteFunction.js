@@ -24,11 +24,13 @@ const statAsync = promisify(fs.stat);
 
 // Константы для Appwrite
 const APPWRITE_ENDPOINT = process.env.APPWRITE_ENDPOINT || 'https://cloud.appwrite.io/v1';
-const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID;
+const APPWRITE_PROJECT_ID = process.env.APPWRITE_PROJECT_ID || '67f2235900328715e56';
 const APPWRITE_API_KEY = process.env.APPWRITE_API_KEY;
-const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID;
+const APPWRITE_DATABASE_ID = process.env.APPWRITE_DATABASE_ID || '67f225f50010cced7742';
 const APPWRITE_COLLECTION_ID = process.env.APPWRITE_COLLECTION_ID || 'posts';
-const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID;
+const APPWRITE_BUCKET_ID = process.env.APPWRITE_BUCKET_ID || '67f22396003840034d78';
+const APPWRITE_COLLECTION_ID_POST = process.env.APPWRITE_COLLECTION_ID_POST || '67f22813001f125cc1e5';
+const APPWRITE_FUNCTION_ID = process.env.APPWRITE_FUNCTION_ID || '67fd5f3793f097add368';
 
 // Добавляем константу для логов, если она будет использоваться
 const APPWRITE_COLLECTION_ID_LOGS = process.env.APPWRITE_COLLECTION_ID_LOGS;
@@ -305,18 +307,9 @@ module.exports = async function(req, res) {
     // Инициализация клиента в начале функции
     const client = new sdk.Client();
     
-    const { 
-      APPWRITE_FUNCTION_PROJECT_ID,
-      APPWRITE_API_KEY,
-      APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID,
-      APPWRITE_BUCKET_ID,
-      APPWRITE_ENDPOINT
-    } = process.env;
-
     client
       .setEndpoint(APPWRITE_ENDPOINT)
-      .setProject(APPWRITE_FUNCTION_PROJECT_ID)
+      .setProject(APPWRITE_PROJECT_ID)
       .setKey(APPWRITE_API_KEY);
     
     const databases = new sdk.Databases(client);
@@ -357,7 +350,7 @@ async function processUnprocessedPosts(databases, storage, client) {
     // Find unprocessed posts
     const posts = await databases.listDocuments(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID,
+      APPWRITE_COLLECTION_ID_POST,
       [
         Query.equal('audio_processed', false),
         Query.equal('audio_processing', false),
@@ -376,7 +369,7 @@ async function processUnprocessedPosts(databases, storage, client) {
       // Mark as processing
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID,
+        APPWRITE_COLLECTION_ID_POST,
         post.$id,
         {
           audio_processing: true
@@ -415,7 +408,7 @@ async function updateUIProgress(postId, databases, step, progress, status = 'pro
     
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID,
+      APPWRITE_COLLECTION_ID_POST,
       postId,
       {
         audio_processing_progress: progressPercentage,
@@ -906,19 +899,19 @@ async function processContinuationPlaylistPreparation(post, req, res, databases,
 async function scheduleContinuationTask(post, delaySeconds = 5) {
   try {
     // Check if we have the environment variables needed for task scheduling
-    if (process.env.APPWRITE_FUNCTION_ID && 
-        process.env.APPWRITE_API_KEY && 
-        process.env.APPWRITE_FUNCTION_PROJECT_ID && 
-        process.env.APPWRITE_ENDPOINT) {
+    if (APPWRITE_FUNCTION_ID && 
+        APPWRITE_API_KEY && 
+        APPWRITE_PROJECT_ID && 
+        APPWRITE_ENDPOINT) {
       
       log(`[SCHEDULER] Creating continuation task for post ${post.$id} with ${delaySeconds}s delay`);
       
       // Create a client for the Appwrite Functions API
       const schedulerClient = new AppwriteClient();
       schedulerClient
-        .setEndpoint(process.env.APPWRITE_ENDPOINT)
-        .setProject(process.env.APPWRITE_FUNCTION_PROJECT_ID)
-        .setKey(process.env.APPWRITE_API_KEY);
+        .setEndpoint(APPWRITE_ENDPOINT)
+        .setProject(APPWRITE_PROJECT_ID)
+        .setKey(APPWRITE_API_KEY);
       
       const functions = new Functions(schedulerClient);
       
@@ -932,7 +925,7 @@ async function scheduleContinuationTask(post, delaySeconds = 5) {
       
       // Execute the function after delay
       const execution = await functions.createExecution(
-        process.env.APPWRITE_FUNCTION_ID,
+        APPWRITE_FUNCTION_ID,
         payload,
         false, // async execution
         `/`, // path 
@@ -1309,7 +1302,7 @@ async function manageProcessingExecution(post, currentStep, databases, client, o
     // Update the post's progress data
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID,
+      APPWRITE_COLLECTION_ID_POST,
       postId,
       {
         audio_progress_data: {
@@ -1401,7 +1394,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
     // Get post document
     const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID,
+      APPWRITE_COLLECTION_ID_POST,
       postId
     );
     
@@ -1551,7 +1544,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
         // Update post with processed flag
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID,
+          APPWRITE_COLLECTION_ID_POST,
           postId,
           {
             audio_processed: true,
