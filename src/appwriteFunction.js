@@ -172,8 +172,8 @@ module.exports = async function(req, res) {
   let payload = {};
   
   // Правильно определяем функции логирования в соответствии с Appwrite
-  const log = (typeof req.log === 'function') ? req.log : console.log;
-  const error = (typeof req.error === 'function') ? req.error : console.error;
+  let log = (typeof req.log === 'function') ? req.log : console.log;
+  let error = (typeof req.error === 'function') ? req.error : console.error;
   
   log('Запуск функции обработки аудио');
   
@@ -182,7 +182,7 @@ module.exports = async function(req, res) {
     log(`Available keys in req: ${Object.keys(req).join(', ')}`);
     
     // Проверяем, имеем ли мы дело с объектом context вместо req/res
-    const isContextPattern = !!(req.req && req.res);
+    let isContextPattern = !!(req.req && req.res);
     if (isContextPattern) {
       log('Detected context pattern, adapting request and response objects');
       // Если мы получили объект context вместо req/res
