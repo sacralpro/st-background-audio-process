@@ -266,6 +266,9 @@ module.exports = async function(req, res) {
       if (typeof context.error === 'function') error = context.error;
     }
     
+    // Добавим задержку в начале, чтобы избежать rate limiting в случае быстрых повторных запусков
+    await sleep(500);
+    
     // Безопасная инициализация payload из разных источников
     if (req.body) {
       try {
@@ -291,36 +294,20 @@ module.exports = async function(req, res) {
       } catch (e) {
         error(`Error parsing req.bodyText: ${e.message}`);
       }
-    } else if (req.rawBody || req.bodyRaw) {
-      // Еще один вариант для обратной совместимости
-      const rawData = req.rawBody || req.bodyRaw;
+    } else if (req.rawBody) {
+      // На случай, если данные приходят в поле rawBody
       try {
-        Object.assign(payload, JSON.parse(rawData));
-        log('Parsed payload from rawBody/bodyRaw');
+        Object.assign(payload, JSON.parse(req.rawBody));
+        log('Parsed payload from req.rawBody');
       } catch (e) {
-        error(`Error parsing rawBody/bodyRaw: ${e.message}`);
+        error(`Error parsing req.rawBody: ${e.message}`);
       }
     }
     
-    // Проверяем функцию APPWRITE_FUNCTION_DATA
-    if (req.variables && req.variables.APPWRITE_FUNCTION_DATA) {
-      try {
-        const functionData = req.variables.APPWRITE_FUNCTION_DATA;
-        log(`Found APPWRITE_FUNCTION_DATA: ${functionData}`);
-        if (typeof functionData === 'string') {
-          Object.assign(payload, JSON.parse(functionData));
-          log('Parsed APPWRITE_FUNCTION_DATA as JSON');
-        } else if (typeof functionData === 'object') {
-          Object.assign(payload, functionData);
-          log('Assigned APPWRITE_FUNCTION_DATA as object');
-        }
-      } catch (e) {
-        error(`Error parsing APPWRITE_FUNCTION_DATA: ${e.message}`);
-      }
+    // Логируем ключи в payload для отладки
+    if (payload && typeof payload === 'object') {
+      log(`Payload keys: ${Object.keys(payload).join(', ')}`);
     }
-    
-    // Логируем ключи payload для отладки
-    log(`Payload keys: ${Object.keys(payload).join(', ')}`);
     
     // Получаем postId из payload или с помощью функции извлечения
     let postId = payload.postId;
@@ -330,7 +317,7 @@ module.exports = async function(req, res) {
       postId = payload.id;
       log(`Using payload.id as postId: ${postId}`);
     }
-
+    
     if (!postId && payload.$id) {
       postId = payload.$id;
       log(`Using payload.$id as postId: ${postId}`);
@@ -342,44 +329,21 @@ module.exports = async function(req, res) {
       postId = extractPostId(req, log, error);
     }
     
-    // Для тестирования - используем тестовый postId если ничего не найдено
+    // Если postId не найден, возвращаем ошибку
     if (!postId) {
-      // Если мы в режиме разработки или тестирования, используем тестовый postId
-      const isDevEnvironment = process.env.NODE_ENV === 'development' || process.env.APP_ENV === 'test';
-      if (isDevEnvironment) {
-        postId = '67ff89bb2ba219fbfac8'; // Тестовый ID для разработки
-        log(`Using test postId for development: ${postId}`);
-      } else {
-        log('postId not found in request');
-        
-        // Возвращаем ответ, используя правильный способ в зависимости от шаблона
-        if (isContextPattern) {
-      return res.json({
+      log('postId not found in request');
+      return safeJsonResponse(res, {
         success: false,
-            message: 'Post ID is required but was not found in the request'
-          });
-        } else {
-          // Стандартный подход для Node.js HTTP ответа
-          if (res && typeof res.setHeader === 'function' && typeof res.end === 'function') {
-            res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({
-              success: false,
-              message: 'Post ID is required but was not found in the request'
-            }));
-            return;
-          } else {
-            // Если мы не можем отправить ответ, логируем ошибку и возвращаем объект
-            error('Unable to send response: res object does not have required methods');
-            return {
-              success: false,
-              message: 'Post ID is required but was not found in the request'
-            };
-          }
-        }
-      }
+        message: 'postId is required but was not found in the request',
+      }, isContextPattern, log, error);
     }
     
     log(`Processing audio for post ID: ${postId}`);
+    
+    // Нативные логи
+    if (typeof req.log !== 'function' || typeof req.error !== 'function') {
+      log('Native logs detected. Use context.log() or context.error() for better experience.');
+    }
     
     // Добавим информацию о клиенте Appwrite
     const sdk = require('node-appwrite');
@@ -395,31 +359,44 @@ module.exports = async function(req, res) {
     const databases = new sdk.Databases(client);
     const storage = new sdk.Storage(client);
     
-    // Начинаем обработку аудио
+    // Обработка запроса с использованием функции с повторными попытками
     try {
+      // Получаем данные поста только один раз, чтобы уменьшить количество запросов
+      const post = await retryWithBackoff(async () => {
+        return await databases.getDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          postId
+        );
+      });
+      
+      // Начинаем обработку аудио с повторными попытками
       const result = await processAudio(postId, databases, storage, client);
+      
       return safeJsonResponse(res, {
         success: true,
-        message: 'Audio processing started',
-        postId: postId,
-        result: result
+        message: 'Audio processing initiated successfully',
+        data: result
       }, isContextPattern, log, error);
-    } catch (processError) {
-      error(`Error processing audio: ${processError.message}`);
-      error(processError.stack);
+      
+    } catch (e) {
+      error(`Error processing audio for post ${postId}:`, e);
+      
       return safeJsonResponse(res, {
         success: false,
-        message: `Error processing audio: ${processError.message}`,
-        postId: postId
+        message: `Error processing audio: ${e.message}`,
+        error: e.message,
+        postId
       }, isContextPattern, log, error);
     }
-  } catch (err) {
-    error(`Unexpected error in main function: ${err.message}`);
-    error(err.stack);
+    
+  } catch (e) {
+    error('Unexpected error in main function:', e);
+    
     return safeJsonResponse(res, {
       success: false,
-      message: 'Unexpected error in audio processing',
-      error: err.message
+      message: `Unexpected error: ${e.message}`,
+      error: e.message
     }, isContextPattern, log, error);
   }
 };
@@ -1377,20 +1354,60 @@ async function cleanupAndUpdateExecution(post, executionRecord, databases, succe
   }
 }
 
+// Добавляем функцию задержки для отложенного выполнения
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// Функция для повторных попыток выполнения запроса с увеличивающейся задержкой
+async function retryWithBackoff(fn, maxRetries = 3, initialDelay = 1000) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      return await fn();
+    } catch (error) {
+      retries++;
+      
+      // Если это не ошибка rate limit или достигнут максимум попыток - выбросить ошибку
+      if (!error.message.includes('Rate limit') || retries >= maxRetries) {
+        throw error;
+      }
+      
+      // Экспоненциальная задержка: 1с, 2с, 4с,...
+      const delay = initialDelay * Math.pow(2, retries - 1);
+      console.log(`Rate limit exceeded. Retrying in ${delay}ms (attempt ${retries}/${maxRetries})`);
+      await sleep(delay);
+    }
+  }
+}
+
+// Обновляем функцию обновления документа, чтобы использовать retry логику
+async function safeUpdateDocument(databases, databaseId, collectionId, documentId, data) {
+  return retryWithBackoff(async () => {
+    return await databases.updateDocument(
+      databaseId,
+      collectionId,
+      documentId,
+      data
+    );
+  });
+}
+
 // This function creates or updates execution records and helps divide work across multiple function calls
 async function manageProcessingExecution(post, currentStep, databases, client, options = {}) {
   const { executionId, progressData = {}, progress = 0 } = options;
   const postId = post.$id;
   
   try {
-    // Обновляем только существующие поля в документе
-    // Вместо audio_progress_data будем использовать поле 'streaming_urls' для хранения информации о прогрессе
-    await databases.updateDocument(
+    // Обновляем только существующие поля в документе с использованием retry логики
+    await safeUpdateDocument(
+      databases,
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
       postId,
       {
-        // Сохраняем информацию о прогрессе в первый элемент массива streaming_urls (если он существует)
+        // Сохраняем информацию о прогрессе в первый элемент массива streaming_urls
         streaming_urls: [`progress:${currentStep}:${executionId}:${new Date().toISOString()}`]
       }
     );
@@ -1520,8 +1537,9 @@ async function processAudio(postId, databases, storage, client, executionId = nu
         };
       }
       
-      // Update post to mark as processing - используем существующие поля
-      await databases.updateDocument(
+      // Update post to mark as processing - используем существующие поля с retry логикой
+      await safeUpdateDocument(
+        databases,
         APPWRITE_DATABASE_ID,
         APPWRITE_COLLECTION_ID_POST,
         postId,
@@ -1630,10 +1648,11 @@ async function processAudio(postId, databases, storage, client, executionId = nu
   } catch (error) {
     console.error('Error processing audio:', error);
     
-    // Обновляем пост с информацией об ошибке, используя только существующие поля
+    // Обновляем пост с информацией об ошибке, используя только существующие поля и retry логику
     try {
       if (postId) {
-        await databases.updateDocument(
+        await safeUpdateDocument(
+          databases,
           APPWRITE_DATABASE_ID,
           APPWRITE_COLLECTION_ID_POST,
           postId,
