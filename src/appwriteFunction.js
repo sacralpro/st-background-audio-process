@@ -166,200 +166,86 @@ function extractPostId(req, log, logError) {
   return findPostIdInObject(req);
 }
 
-// Main entry point for Appwrite Function - Single context parameter format
-async function appwriteFunction(context) {
-  // Ensure context exists and set safe defaults
-  if (!context) {
-    context = { req: {}, res: { json: (data) => data } };
-  }
-  
-  // Create safe logging functions
-  const log = (context.log && typeof context.log === 'function') 
-    ? context.log 
-    : (...args) => console.log('[APPWRITE_FUNCTION]', ...args);
-    
-  const logError = (context.error && typeof context.error === 'function')
-    ? context.error
-    : (...args) => console.error('[APPWRITE_FUNCTION_ERROR]', ...args);
-  
-  log('Audio processing function started via context');
-  
-  // Извлекаем параметры из bodyJson в контексте Appwrite
-  let postId = null;
-  let payload = {};
-  
-  // === REQUEST DEBUG INFO ===
-  log("=== REQUEST DEBUG INFO ===");
-  log(`Request type: ${typeof context}`);
-  if (context && context.req) {
-    log(`Request keys: ${Object.keys(context.req).join(', ')}`);
-  }
-  
-  // Создаем безопасную копию объекта req без циклических ссылок
-  const safeReq = {};
-  if (context.req) {
-    // Копируем только необходимые свойства, избегая дублирования
-    if (context.req.body) {
-      safeReq.body = context.req.body;
-    }
-    if (context.req.headers) {
-      safeReq.headers = context.req.headers;
-    }
-    if (context.req.params) {
-      safeReq.params = context.req.params;
-    }
-    // Другие необходимые свойства
-  }
-  
-  // Извлечение из разных мест контекста
-  if (context.req) {
-    // Из bodyJson (специфично для Appwrite)
-    if (context.req.bodyJson) {
-      log('Found bodyJson in context');
-      payload = context.req.bodyJson;
-      
-      if (payload.postId) {
-        postId = payload.postId;
-        log(`Found postId in bodyJson: ${postId}`);
-      }
-    }
-    // Из body как строки
-    else if (context.req.body && typeof context.req.body === 'string') {
-      log('Found body string in context');
-      try {
-        payload = JSON.parse(context.req.body);
-        if (payload.postId) {
-          postId = payload.postId;
-          log(`Found postId in parsed body: ${postId}`);
-        }
-      } catch (e) {
-        logError(`Error parsing body: ${e.message}`);
-      }
-    }
-    // Из body как объекта
-    else if (context.req.body && typeof context.req.body === 'object') {
-      log('Found body object in context');
-      payload = context.req.body;
-      
-      if (payload.postId) {
-        postId = payload.postId;
-        log(`Found postId in body object: ${postId}`);
-      }
-    }
-  }
-  
-  // Если postId не найден, проверяем прямой параметр
-  if (!postId && context.params && context.params.postId) {
-    postId = context.params.postId;
-    log(`Found postId in context.params: ${postId}`);
-  }
-  
-  // Вызов основной функции с извлеченными параметрами
-  if (postId) {
-    log(`Processing post with ID: ${postId}`);
-    return await module.exports({
-      body: { postId },
-      headers: context.req ? context.req.headers : {},
-      log: log,
-      error: logError
-    }, context.res || { json: (data) => data });
-  } else {
-    logError('No postId found in request');
-    return (context.res && context.res.json) 
-      ? context.res.json({ success: false, message: 'No postId provided' })
-      : { success: false, message: 'No postId provided' };
-  }
-}
-
 // Main function
 module.exports = async function(req, res) {
-  // Enhanced logging for debugging
-  console.log(`Request received with keys: ${Object.keys(req).join(', ')}`);
-  
-  // Предотвращаем циклические ссылки
-  let safeReq = {};
-  try {
-    // Копируем только необходимые поля из req
-    if (req) {
-      if (req.body) safeReq.body = req.body;
-      if (req.headers) safeReq.headers = req.headers;
-      if (req.params) safeReq.params = req.params;
-      if (req.log) safeReq.log = req.log;
-      if (req.error) safeReq.error = req.error;
-    }
-  } catch (e) {
-    console.error("Error while creating safe req object:", e);
-  }
-  
-  // Initialize payload as an empty object
+  // Инициализируем объект payload заранее
   let payload = {};
   
+  // Правильно определяем функции логирования
+  const log = req.log || console.log;
+  const error = req.error || console.error;
+  
+  log('Запуск функции обработки аудио');
+  
   try {
-    // Используем context.log если доступен, иначе console.log
-    const log = (req.log && typeof req.log === 'function') ? req.log : console.log;
-    const logError = (req.error && typeof req.error === 'function') ? req.error : console.error;
+    // Логируем все доступные ключи для отладки
+    log(`Available keys in req: ${Object.keys(req).join(', ')}`);
     
-    // Извлекаем payload из req.body (если доступен)
+    // Безопасная инициализация payload из разных источников
     if (req.body) {
-      log('Request body available, attempting to parse');
-      if (typeof req.body === 'string') {
-        try {
-          payload = JSON.parse(req.body);
-          log('Successfully parsed JSON from req.body string');
-        } catch (e) {
-          logError(`Error parsing JSON from body: ${e.message}`);
-          payload = { rawBody: req.body };
+      try {
+        if (typeof req.body === 'string') {
+          Object.assign(payload, JSON.parse(req.body));
+          log('Parsed payload from req.body (string)');
+        } else if (typeof req.body === 'object') {
+          Object.assign(payload, req.body);
+          log('Assigned payload from req.body (object)');
         }
-      } else if (typeof req.body === 'object') {
-        log('Using req.body object directly');
-        payload = req.body;
+      } catch (e) {
+        error(`Error parsing req.body: ${e.message}`);
       }
-    } else {
-      log('req.body is empty or undefined');
-      
-      // Проверяем альтернативные источники payload
-      if (req.rawBody || req.bodyRaw) {
-        const rawBody = req.rawBody || req.bodyRaw;
-        log('Found rawBody, attempting to parse');
-        try {
-          payload = JSON.parse(rawBody);
-          log('Successfully parsed JSON from rawBody');
-        } catch (e) {
-          logError(`Error parsing JSON from rawBody: ${e.message}`);
-          payload = { rawBody };
-        }
+    } else if (req.bodyJson) {
+      // В новых версиях Appwrite
+      Object.assign(payload, req.bodyJson);
+      log('Assigned payload from req.bodyJson');
+    } else if (req.bodyText) {
+      // Альтернативный источник в новых версиях Appwrite
+      try {
+        Object.assign(payload, JSON.parse(req.bodyText));
+        log('Parsed payload from req.bodyText');
+      } catch (e) {
+        error(`Error parsing req.bodyText: ${e.message}`);
       }
-    }
-    
-    log(`Payload keys: ${Object.keys(payload).join(', ') || 'none'}`);
-    
-    // Извлекаем postId, используя нашу вспомогательную функцию
-    let postId = null;
-    
-    // Сначала проверяем payload
-    if (payload && payload.postId) {
-      postId = payload.postId;
-      log(`Found postId in payload: ${postId}`);
-    } else {
-      // Если не нашли в payload, используем вспомогательную функцию
-      postId = extractPostId(safeReq, log, logError);
-      
-      if (!postId) {
-        log('No postId found in the request');
-        
-        // Безопасный ответ
-        if (res && typeof res.json === 'function') {
-          return res.json({
-            success: false,
-            message: 'No postId found in request'
-          });
-        } else {
-          return { success: false, message: 'No postId found in request' };
-        }
+    } else if (req.rawBody || req.bodyRaw) {
+      // Еще один вариант для обратной совместимости
+      const rawData = req.rawBody || req.bodyRaw;
+      try {
+        Object.assign(payload, JSON.parse(rawData));
+        log('Parsed payload from rawBody/bodyRaw');
+      } catch (e) {
+        error(`Error parsing rawBody/bodyRaw: ${e.message}`);
       }
     }
     
-    log(`Processing postId: ${postId}`);
+    // Логируем ключи payload для отладки
+    log(`Payload keys: ${Object.keys(payload).join(', ')}`);
+    
+    // Получаем postId из payload или с помощью функции извлечения
+    let postId = payload.postId;
+    
+    // Если postId не найден в payload, используем функцию извлечения
+    if (!postId) {
+      log('postId not found in payload, trying to extract from request');
+      postId = extractPostId(req, log, error);
+    }
+    
+    // Проверяем наличие postId перед продолжением
+    if (!postId) {
+      log('postId not found in request');
+      
+      // Проверяем res перед использованием
+      if (res && typeof res.json === 'function') {
+        return res.json({
+          success: false,
+          message: 'Post ID is required but was not found in the request'
+        });
+      } else {
+        error('res.json is not available');
+        throw new Error('Post ID is required but was not found in the request');
+      }
+    }
+    
+    log(`Processing audio for post ID: ${postId}`);
     
     // Добавим информацию о клиенте Appwrite
     const sdk = require('node-appwrite');
