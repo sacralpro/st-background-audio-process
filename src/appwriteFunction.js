@@ -1379,9 +1379,16 @@ async function processAudio(postId, databases, storage, client, executionId = nu
     execution_time_ms: 0
   };
   
-  // Logging helpers
-  const log = (message) => log(`[${executionRecord.$id}] ${message}`);
-  const logError = (message, error) => logError(`[${executionRecord.$id}] ${message}`, error);
+  // Logging helpers - исправляем бесконечную рекурсию
+  // БЫЛО: const log = (message) => log(`[${executionRecord.$id}] ${message}`);
+  // БЫЛО: const logError = (message, error) => logError(`[${executionRecord.$id}] ${message}`, error);
+  
+  // Создаем правильные wrapper-функции, которые ссылаются на console.log и console.error, а не на себя
+  const logFn = console.log;
+  const errorFn = console.error;
+  
+  const log = (message) => logFn(`[${executionRecord.$id}] ${message}`);
+  const logError = (message, err) => errorFn(`[${executionRecord.$id}] ${message}`, err);
   
   try {
     log(`Starting audio processing for post ${postId}`);
