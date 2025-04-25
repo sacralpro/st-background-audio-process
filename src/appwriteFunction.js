@@ -1240,7 +1240,7 @@ async function processContinuationPlaylistCreation(post, req, res, databases, st
 }
 
 async function cleanupAndUpdateExecution(post, executionRecord, databases, success = true, errorMessage = null) {
-  log(`Updating execution record ${executionRecord?.$id || 'unknown'}`);
+  console.log(`Updating execution record ${executionRecord?.$id || 'unknown'}`);
   
   try {
     // Check if we need to clean up temp files
@@ -1267,29 +1267,33 @@ async function cleanupAndUpdateExecution(post, executionRecord, databases, succe
         
         await deleteTempFiles(post.processing_temp_dir);
         fs.rmdirSync(post.processing_temp_dir);
-        log(`Temporary directory cleaned up: ${post.processing_temp_dir}`);
+        console.log(`Temporary directory cleaned up: ${post.processing_temp_dir}`);
       } catch (cleanupError) {
-        logError('Error cleaning up temporary files:', cleanupError);
+        console.error('Error cleaning up temporary files:', cleanupError);
         // Continue despite cleanup error
       }
     }
     
-    // Update execution record if available
-    if (executionRecord && executionRecord.$id) {
-      await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_EXECUTION,
-        executionRecord.$id,
-        {
-          status: success ? 'completed' : 'error',
-          completion_time: new Date().toISOString(),
-          error_message: errorMessage || null
-        }
-      );
-      log(`Execution record updated: ${executionRecord.$id}`);
+    // Обновляем статус обработки в документе поста вместо записи в отдельной коллекции
+    if (post && post.$id) {
+      try {
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          post.$id,
+          {
+            processing_status: success ? 'completed' : 'error',
+            processing_completed_at: new Date().toISOString(),
+            processing_error: errorMessage || null
+          }
+        );
+        console.log(`Post ${post.$id} updated with execution status`);
+      } catch (updateError) {
+        console.error('Error updating post with execution status:', updateError);
+      }
     }
   } catch (error) {
-    logError('Error in cleanup and execution update:', error);
+    console.error('Error in cleanup and execution update:', error);
   }
 }
 
@@ -1331,10 +1335,14 @@ async function manageProcessingExecution(post, currentStep, databases, client, o
 // Check execution limits
 async function shouldStartNewExecution(postId, databases) {
   try {
-    // Check if there are too many recent executions (to prevent infinite loops)
+    // Поскольку у нас нет коллекции для отслеживания выполнений,
+    // мы всегда разрешаем начать новое выполнение
+    return true;
+    
+    /* Старый код, требующий коллекцию APPWRITE_COLLECTION_ID_EXECUTION
     const recentExecutions = await databases.listDocuments(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID_EXECUTION,
+      APPWRITE_COLLECTION_ID_EXECUTION || 'executions',
       [
         Query.equal('post_id', postId),
         Query.greaterThan('start_time', new Date(Date.now() - 3600000).toISOString()), // Last hour
@@ -1343,14 +1351,15 @@ async function shouldStartNewExecution(postId, databases) {
     
     // If more than 10 executions in the last hour, prevent new execution
     if (recentExecutions.documents.length > 10) {
-      log(`Too many recent executions (${recentExecutions.documents.length}) for post ${postId}`);
+      console.log(`Too many recent executions (${recentExecutions.documents.length}) for post ${postId}`);
       return false;
     }
     
     return true;
+    */
   } catch (err) {
-    logError(`Error checking execution limits for post ${postId}:`, err);
-    return false;
+    console.error(`Error checking execution limits for post ${postId}:`, err);
+    return true; // В случае ошибки всё равно разрешаем выполнение
   }
 }
 
@@ -1372,11 +1381,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
     execution_time_ms: 0
   };
   
-  // Logging helpers - исправляем бесконечную рекурсию
-  // БЫЛО: const log = (message) => log(`[${executionRecord.$id}] ${message}`);
-  // БЫЛО: const logError = (message, error) => logError(`[${executionRecord.$id}] ${message}`, error);
-  
-  // Создаем правильные wrapper-функции, которые ссылаются на console.log и console.error, а не на себя
+  // Создаем правильные wrapper-функции, которые ссылаются на console.log и console.error
   const logFn = console.log;
   const errorFn = console.error;
   
@@ -1479,7 +1484,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
       // Update post to mark as processing
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID,
+        APPWRITE_COLLECTION_ID_POST,
         postId,
         {
           audio_processing: true,
@@ -1595,7 +1600,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
       if (postId) {
         await databases.updateDocument(
           APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID,
+          APPWRITE_COLLECTION_ID_POST,
           postId,
           {
             audio_processing: false,
