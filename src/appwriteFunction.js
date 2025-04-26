@@ -237,157 +237,126 @@ function extractPostId(req, log, logError) {
   return findPostIdInObject(req);
 }
 
-// Main function
+// Основная функция обработки, экспортируемая модулем
 module.exports = async function(req, res) {
   // Инициализируем объект payload заранее
   let payload = {};
-  let postData = null; // Сохраняем данные поста, чтобы не запрашивать снова
+  let postId = null;
   
   // Правильно определяем функции логирования в соответствии с Appwrite
-  let log = (typeof req.log === 'function') ? req.log : console.log;
-  let error = (typeof req.error === 'function') ? req.error : console.error;
+  const log = (typeof req?.log === 'function') ? req.log : console.log;
+  const logError = (typeof req?.error === 'function') ? req.error : console.error;
   
   log('Запуск функции обработки аудио');
   
   try {
-    // Базовая задержка для предотвращения быстрых повторных запусков
-    await sleep(1000);
+    // Логируем доступные ключи в req для отладки
+    log(`Request keys: ${req ? Object.keys(req).join(', ') : 'req is undefined'}`);
     
-    // Логируем все доступные ключи для отладки
-    log(`Available keys in req: ${Object.keys(req).join(', ')}`);
-    
-    // Проверяем, имеем ли мы дело с объектом context вместо req/res
-    let isContextPattern = !!(req.req && req.res);
-    if (isContextPattern) {
-      log('Detected context pattern, adapting request and response objects');
-      // Если мы получили объект context вместо req/res
-      const context = req;
-      req = context.req || {};
-      res = context.res || {};
-      
-      // Обновляем функции логов
-      if (typeof context.log === 'function') log = context.log;
-      if (typeof context.error === 'function') error = context.error;
-    }
-    
-    // Безопасная инициализация payload из разных источников
-    if (req.body) {
+    // Получение и парсинг payload
+    if (req && req.body) {
       try {
         if (typeof req.body === 'string') {
-          Object.assign(payload, JSON.parse(req.body));
-          log('Parsed payload from req.body (string)');
+          payload = JSON.parse(req.body);
         } else if (typeof req.body === 'object') {
-          Object.assign(payload, req.body);
-          log('Assigned payload from req.body (object)');
+          payload = req.body;
         }
       } catch (e) {
-        error(`Error parsing req.body: ${e.message}`);
+        logError('Error parsing request body:', e);
       }
-    } else if (req.bodyJson) {
-      Object.assign(payload, req.bodyJson);
-      log('Assigned payload from req.bodyJson');
-    } else if (req.bodyText) {
-      try {
-        Object.assign(payload, JSON.parse(req.bodyText));
-        log('Parsed payload from req.bodyText');
-      } catch (e) {
-        error(`Error parsing req.bodyText: ${e.message}`);
-      }
-    } else if (req.rawBody) {
-      try {
-        Object.assign(payload, JSON.parse(req.rawBody));
-        log('Parsed payload from req.rawBody');
-      } catch (e) {
-        error(`Error parsing req.rawBody: ${e.message}`);
+    }
+    
+    // Проверка наличия payload в альтернативных источниках
+    if (Object.keys(payload).length === 0 && req) {
+      if (req.rawBody) {
+        try {
+          payload = JSON.parse(req.rawBody);
+        } catch (e) {
+          // Игнорируем ошибку, просто продолжим
+        }
+      } else if (req.bodyRaw) {
+        try {
+          payload = JSON.parse(req.bodyRaw);
+        } catch (e) {
+          // Игнорируем ошибку, просто продолжим
+        }
       }
     }
     
     // Логируем ключи в payload для отладки
-    if (payload && typeof payload === 'object') {
-      log(`Payload keys: ${Object.keys(payload).join(', ')}`);
+    log(`Payload keys: ${Object.keys(payload).join(', ')}`);
+    
+    // Получаем postId различными способами
+    if (payload && payload.postId) {
+      postId = payload.postId;
+      log(`Using postId from payload: ${postId}`);
+    } else if (req) {
+      // Пытаемся извлечь postId из других источников
+      postId = extractPostId(req, log, logError);
+      log(`Extracted postId: ${postId}`);
     }
     
-    // Получаем postId из payload или с помощью функции извлечения
-    let postId = payload.postId;
-    
-    // Если postId не найден, пробуем использовать альтернативные поля id или $id
-    if (!postId && payload.id) {
-      postId = payload.id;
-      log(`Using payload.id as postId: ${postId}`);
-    }
-    
-    if (!postId && payload.$id) {
-      postId = payload.$id;
-      log(`Using payload.$id as postId: ${postId}`);
-    }
-    
-    // Если post передан напрямую в payload, используем его
-    if (payload && typeof payload === 'object' && Object.keys(payload).length > 5) {
-      postData = payload; // Используем сам payload как данные поста
-      log(`Using payload directly as post data`);
-    }
-    
-    // Если postId все еще не найден в payload, используем функцию извлечения
+    // Проверяем, что postId был найден
     if (!postId) {
-      log('postId not found in payload, trying to extract from request');
-      postId = extractPostId(req, log, error);
-    }
-    
-    // Если postId не найден, возвращаем ошибку
-    if (!postId) {
-      log('postId not found in request');
-      return safeJsonResponse(res, {
-        success: false,
-        message: 'postId is required but was not found in the request',
-      }, isContextPattern, log, error);
-    }
-    
-    log(`Processing audio for post ID: ${postId}`);
-    
-    // Нативные логи
-    if (typeof req.log !== 'function' || typeof req.error !== 'function') {
-      log('Native logs detected. Use context.log() or context.error() for better experience.');
-    }
-    
-    // Инициализация Appwrite SDK
-    const sdk = require('node-appwrite');
-    const client = new sdk.Client()
-      .setEndpoint(APPWRITE_ENDPOINT)
-      .setProject(APPWRITE_PROJECT_ID)
-      .setKey(APPWRITE_API_KEY);
-    
-    const databases = new sdk.Databases(client);
-    const storage = new sdk.Storage(client);
-    
-    // ВАЖНОЕ ИЗМЕНЕНИЕ: Упрощаем процесс обработки, делая только самые необходимые API-запросы
-    try {
-      // Проверка, проводится ли уже обработка для данного поста
-      // Используем сокращенную версию processAudio, которая делает минимальное количество API-запросов
-      const result = await simplifiedAudioProcessing(postId, postData, databases, storage, client);
+      log('No postId found in request');
       
-      return safeJsonResponse(res, {
-        success: true,
-        message: 'Audio processing initiated with rate limiting protection',
-        data: result
-      }, isContextPattern, log, error);
-    } catch (e) {
-      error(`Error processing audio for post ${postId}:`, e);
-      
-      return safeJsonResponse(res, {
+      // Безопасная отправка ответа, проверяем наличие res и метода json
+      if (res && typeof res.json === 'function') {
+      return res.json({
         success: false,
-        message: `Error processing audio: ${e.message}`,
-        error: e.message,
-        postId
-      }, isContextPattern, log, error);
+          message: 'No postId found in request'
+        });
+      } else if (typeof req?.json === 'function') {
+        // Новый API Appwrite использует context.req.json
+        return req.json({
+          success: false,
+          message: 'No postId found in request'
+        });
+      } else {
+        // Для контекста без res/req.json
+        logError('Cannot send response - no available response methods');
+        return {
+          success: false,
+          message: 'No postId found in request'
+        };
+      }
     }
-  } catch (e) {
-    error('Unexpected error in main function:', e);
     
-    return safeJsonResponse(res, {
+    // Остальная логика обработки запроса...
+    // Запускаем обработку аудио
+    const result = await simplifiedAudioProcessing(postId, null, databases, storage, client);
+    
+    // Безопасно отправляем ответ
+    if (res && typeof res.json === 'function') {
+      return res.json(result);
+    } else if (typeof req?.json === 'function') {
+      // Новый API Appwrite использует context.req.json
+      return req.json(result);
+    } else {
+      // Для контекста без res/req.json
+      log('Returning result as object (no response methods available)');
+      return result;
+    }
+    
+  } catch (error) {
+    logError('Error in main function:', error);
+    
+    // Безопасно отправляем ошибку
+    const errorResponse = {
       success: false,
-      message: `Unexpected error: ${e.message}`,
-      error: e.message
-    }, isContextPattern, log, error);
+      error: error.message || 'Unknown error',
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    };
+    
+    if (res && typeof res.json === 'function') {
+      return res.json(errorResponse);
+    } else if (typeof req?.json === 'function') {
+      // Новый API Appwrite использует context.req.json
+      return req.json(errorResponse);
+    } else {
+      // Для контекста без res/req.json
+      return errorResponse;
+    }
   }
 };
 
@@ -409,6 +378,36 @@ async function simplifiedAudioProcessing(postId, existingPostData, databases, st
     });
     
     log(`Retrieved post ${post.$id}`);
+    
+    // ВАЖНО: Проверка на частые выполнения, чтобы избежать бесконечного цикла
+    const recentExecutions = (post.streaming_urls || []).filter(url => 
+      typeof url === 'string' &&
+      (url.startsWith('processing-start:') || url.startsWith('processing:')) && 
+      new Date(url.split(':')[2]) > new Date(Date.now() - 3600000) // За последний час
+    );
+    
+    if (recentExecutions.length >= 5) {
+      log(`Обнаружено слишком много недавних выполнений (${recentExecutions.length}) для поста ${postId}, прерываем обработку`);
+      return {
+        success: false,
+        message: 'Слишком много недавних выполнений, прерываем для предотвращения бесконечного цикла',
+        postId
+      };
+    }
+    
+    // Проверяем, было ли запущено выполнение в течение последних 30 секунд
+    const veryRecentExecutions = recentExecutions.filter(
+      url => new Date(url.split(':')[2]) > new Date(Date.now() - 30000) // За последние 30 секунд
+    );
+    
+    if (veryRecentExecutions.length > 0) {
+      log(`Обнаружено выполнение, начатое менее 30 секунд назад для поста ${postId}, прерываем дублирование`);
+      return {
+        success: false,
+        message: 'Обработка уже начата менее 30 секунд назад, предотвращаем дублирование',
+        postId
+      };
+    }
     
     // Проверяем, есть ли уже обработанное аудио
     if (post.mp3_url || post.m3u8_url) {
@@ -722,14 +721,7 @@ async function processContinuationDownload(post, req, res, databases, storage, e
     );
     
     // Schedule FFmpeg processing
-    const taskId = await scheduleContinuationTask(
-      {
-        ...post,
-        processing_stage: 'ffmpeg_process',
-        mp3_file_id: mp3UploadResult.$id
-      }, 
-      3
-    );
+    const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
     
     return res.json({
       success: true,
@@ -852,15 +844,7 @@ async function processContinuationFFmpeg(post, req, res, databases, storage, exe
     );
     
     // Schedule playlist preparation
-    const taskId = await scheduleContinuationTask(
-      {
-        ...post,
-        processing_stage: 'playlist_preparation',
-        m3u8_path: m3u8Path,
-        hls_dir: hlsDir
-      }, 
-      3
-    );
+    const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
     
     return res.json({
       success: true,
@@ -937,15 +921,7 @@ async function processContinuationPlaylistPreparation(post, req, res, databases,
       );
       
       // Schedule segment upload
-      const taskId = await scheduleContinuationTask(
-        {
-          ...post,
-          processing_stage: 'segment_upload',
-          segment_files_remaining: segmentFiles.length,
-          segment_files_processed: 0
-        }, 
-        3
-      );
+      const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
       
       return res.json({
         success: true,
@@ -1000,15 +976,7 @@ async function processContinuationPlaylistPreparation(post, req, res, databases,
       );
       
       // Schedule playlist creation
-      const taskId = await scheduleContinuationTask(
-        {
-          ...post,
-          processing_stage: 'playlist_creation',
-          hls_segment_ids: segmentIds,
-          segment_urls: segmentUrls
-        }, 
-        3
-      );
+      const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
       
       return res.json({
         success: true,
@@ -1046,54 +1014,63 @@ async function processContinuationPlaylistPreparation(post, req, res, databases,
   }
 }
 
-// Helper function to schedule a continuation if task scheduler is enabled
-async function scheduleContinuationTask(post, delaySeconds = 5) {
+// Планирование задачи продолжения
+async function scheduleContinuationTask(postId, post, executionId, delaySeconds = 5) {
   try {
-    // Check if we have the environment variables needed for task scheduling
-    if (APPWRITE_FUNCTION_ID && 
-        APPWRITE_API_KEY && 
-        APPWRITE_PROJECT_ID && 
-        APPWRITE_ENDPOINT) {
-      
-      log(`[SCHEDULER] Creating continuation task for post ${post.$id} with ${delaySeconds}s delay`);
-      
-      // Create a client for the Appwrite Functions API
-      const schedulerClient = new AppwriteClient();
-      schedulerClient
-        .setEndpoint(APPWRITE_ENDPOINT)
-        .setProject(APPWRITE_PROJECT_ID)
-        .setKey(APPWRITE_API_KEY);
-      
-      const functions = new Functions(schedulerClient);
-      
-      // Create execution payload
-      const payload = JSON.stringify({
-        postId: post.$id,
-        isContinuation: true,
-        stage: post.processing_stage,
-        continuationToken: `continuation-${post.$id}-${Date.now()}`
-      });
-      
-      // Execute the function after delay
-      const execution = await functions.createExecution(
-        APPWRITE_FUNCTION_ID,
-        payload,
-        false, // async execution
-        `/`, // path 
-        'POST', // method
-        { 'X-Appwrite-Continuation': 'true' } // custom headers
-      );
-      
-      log(`[SCHEDULER] Created continuation task, execution ID: ${execution.$id}`);
-      
-      return execution.$id;
-    } else {
-      log('[SCHEDULER] Task scheduling disabled due to missing environment variables');
-      return null;
+    // Проверяем, сколько задач продолжения уже запланировано для этого поста
+    const continuationCount = (post?.streaming_urls || [])
+      .filter(url => typeof url === 'string' && url.includes('continuation-task:'))
+      .length;
+    
+    log(`[scheduleContinuationTask] Current continuation count for post ${postId}: ${continuationCount}`);
+    
+    // Ограничиваем количество продолжений для предотвращения бесконечных циклов
+    if (continuationCount >= 10) {
+      const message = `Maximum number of continuations (10) reached for post ${postId}. Aborting to prevent looping.`;
+      log(message);
+      return {
+        success: false,
+        message: message
+      };
     }
+    
+    log(`[scheduleContinuationTask] Scheduling continuation task for post ${postId} with delay ${delaySeconds}s`);
+    
+    // Обновляем пост информацией о запланированной задаче
+    const continuationTimestamp = new Date().toISOString();
+    const continuationInfo = `continuation-task: scheduled at ${continuationTimestamp} with delay ${delaySeconds}s`;
+    
+    // Добавляем информацию о продолжении в streaming_urls, если они существуют
+    const streamingUrls = post?.streaming_urls || [];
+    streamingUrls.push(continuationInfo);
+    
+    // Обновляем пост с новой информацией о продолжении
+    await databases.updateDocument(
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      { 
+        streaming_urls: streamingUrls,
+        processing_continuation_scheduled: true,
+        processing_next_step_at: new Date(Date.now() + (delaySeconds * 1000)).toISOString()
+      }
+    );
+    
+    // ВАЖНО: Вместо автоматического планирования, просто логируем намерение
+    log(`[scheduleContinuationTask] Continuation task scheduled for post ${postId}. Next step should be executed manually or via external scheduler.`);
+    
+    // Возвращаем успешный результат, но без реального планирования
+    return {
+      success: true,
+      message: `Continuation task scheduled for post ${postId}. Execute manually.`,
+      continuationCount: continuationCount + 1
+    };
   } catch (error) {
-    logError('[SCHEDULER] Error scheduling continuation task:', error);
-    return null;
+    logError(`[scheduleContinuationTask] Error scheduling continuation task: ${error.message}`);
+    return {
+      success: false,
+      message: error.message
+    };
   }
 }
 
@@ -1179,15 +1156,7 @@ async function processContinuationSegmentUpload(post, req, res, databases, stora
       );
       
       // Schedule the next batch
-      const taskId = await scheduleContinuationTask(
-        { 
-          ...post, 
-          processing_stage: 'segment_upload',
-          processing_uploaded_segments: newUploadedSegments,
-          processing_segments_to_upload: remainingSegments
-        },
-        3
-      );
+      const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
       
       return res.json({
         success: true,
@@ -1214,14 +1183,7 @@ async function processContinuationSegmentUpload(post, req, res, databases, stora
       );
       
       // Schedule playlist creation
-      const taskId = await scheduleContinuationTask(
-        { 
-          ...post, 
-          processing_stage: 'playlist_creation',
-          processing_uploaded_segments: newUploadedSegments
-        },
-        3
-      );
+      const taskId = await scheduleContinuationTask(post.$id, post, executionRecord.$id, 3);
     
     return res.json({
       success: true,
@@ -1533,31 +1495,45 @@ async function manageProcessingExecution(post, currentStep, databases, client, o
 // Check execution limits
 async function shouldStartNewExecution(postId, databases) {
   try {
-    // Поскольку у нас нет коллекции для отслеживания выполнений,
-    // мы всегда разрешаем начать новое выполнение
-    return true;
-    
-    /* Старый код, требующий коллекцию APPWRITE_COLLECTION_ID_EXECUTION
-    const recentExecutions = await databases.listDocuments(
+    // Получаем документ поста для проверки истории выполнений
+    const post = await databases.getDocument(
       APPWRITE_DATABASE_ID,
-      APPWRITE_COLLECTION_ID_EXECUTION || 'executions',
-      [
-        Query.equal('post_id', postId),
-        Query.greaterThan('start_time', new Date(Date.now() - 3600000).toISOString()), // Last hour
-      ]
+      APPWRITE_COLLECTION_ID_POST,
+      postId
     );
     
-    // If more than 10 executions in the last hour, prevent new execution
-    if (recentExecutions.documents.length > 10) {
-      console.log(`Too many recent executions (${recentExecutions.documents.length}) for post ${postId}`);
+    // Проверяем streaming_urls на наличие недавних выполнений
+    const recentExecutions = (post.streaming_urls || [])
+      .filter(url => 
+        typeof url === 'string' && 
+        (url.startsWith('processing-start:') || url.startsWith('processing:')) && 
+        new Date(url.split(':')[2]) > new Date(Date.now() - 3600000) // За последний час
+      );
+    
+    console.log(`Found ${recentExecutions.length} recent executions for post ${postId}`);
+    
+    // Если более 5 выполнений за последний час, предотвращаем новое
+    if (recentExecutions.length >= 5) {
+      console.log(`Too many recent executions (${recentExecutions.length}) for post ${postId}, preventing new execution`);
+      return false;
+    }
+    
+    // Проверяем, нет ли уже выполнения, которое началось менее 30 секунд назад
+    const veryRecentExecutions = recentExecutions.filter(
+      url => new Date(url.split(':')[2]) > new Date(Date.now() - 30000) // За последние 30 секунд
+    );
+    
+    if (veryRecentExecutions.length > 0) {
+      console.log(`Execution already started for post ${postId} in the last 30 seconds, preventing duplicate`);
       return false;
     }
     
     return true;
-    */
   } catch (err) {
     console.error(`Error checking execution limits for post ${postId}:`, err);
-    return true; // В случае ошибки всё равно разрешаем выполнение
+    // В случае ошибки всё равно разрешаем выполнение, но с предупреждением
+    console.log(`WARNING: Could not check execution limits, proceeding with caution for post ${postId}`);
+    return true;
   }
 }
 
@@ -1784,16 +1760,27 @@ async function processAudio(postId, databases, storage, client, executionId = nu
 
 // Вспомогательная функция для безопасной отправки JSON-ответа
 function safeJsonResponse(res, data, isContextPattern, log, error) {
+  // Защита от undefined res
+  if (!res) {
+    error('safeJsonResponse: res object is undefined');
+    return data;
+  }
+  
   // Если используется шаблон с контекстом (context.res)
   if (isContextPattern) {
-    return res.json(data);
+    if (typeof res.json === 'function') {
+      return res.json(data);
+    }
   }
   
   // Для стандартного Node.js HTTP ответа
-  if (res && typeof res.setHeader === 'function' && typeof res.end === 'function') {
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify(data));
-    return;
+  if (typeof res.json === 'function') {
+    return res.json(data);
+  } else if (typeof res.send === 'function') {
+    return res.send(JSON.stringify(data));
+  } else if (typeof res.end === 'function') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify(data));
   }
   
   // Если мы не можем отправить ответ, логируем ошибку и возвращаем объект
