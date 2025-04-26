@@ -620,6 +620,18 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
         updatedStreamingUrls = [newStreamingUrl];
       }
       
+      // Обрабатываем description, чтобы не превышал 999 символов
+      let updatedDescription = post.description || "";
+      const processingMsg = `[Processing started at ${new Date().toISOString()} from ${source}]`;
+      
+      // Ограничиваем общую длину до 950 символов, чтобы оставить место для сообщения о процессе
+      if (updatedDescription.length > 950) {
+        updatedDescription = updatedDescription.substring(0, 945) + "...";
+      }
+      
+      // Добавляем сообщение о начале обработки
+      updatedDescription = updatedDescription ? `${updatedDescription}\n${processingMsg}` : processingMsg;
+      
       await retryWithBackoff(async () => {
         return await databases.updateDocument(
           APPWRITE_DATABASE_ID,
@@ -627,9 +639,7 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
           postId,
           {
             streaming_urls: updatedStreamingUrls,
-            description: post.description ? 
-              `${post.description}\n[Processing started at ${new Date().toISOString()} from ${source}]` : 
-              `[Processing started at ${new Date().toISOString()} from ${source}]`
+            description: updatedDescription
           }
         );
       }, 5, 3000);
@@ -644,7 +654,8 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
     console.log(`[${executionId}] Starting actual audio processing for post ${postId}`);
     
     // Здесь выполняется фактическая обработка аудио
-    const result = await processAudio(postId, post.audio_url, executionId);
+    // ИСПРАВЛЕНО: Передаем параметры в правильном порядке
+    const result = await processAudio(postId, databases, storage, client, executionId);
     
     // Снимаем блокировку после завершения
     processingPosts.delete(postId);
