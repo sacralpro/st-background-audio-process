@@ -635,13 +635,13 @@ module.exports = async function(req, res) {
     // Логируем количество запусков для этого поста
     const currentCount = postExecutionCounts.get(postId) || 0;
     
-    // НОВОЕ: Проверяем, не превышено ли максимальное количество выполнений (5 раз)
-    if (currentCount >= 5) {
-      log(`[${executionId}] Maximum number of executions (5) reached for post ${postId}. Blocking further attempts.`);
+    // НОВОЕ: Проверяем, не превышено ли максимальное количество выполнений (1 раз)
+    if (currentCount >= 1) {
+      log(`[${executionId}] Maximum number of executions (1) reached for post ${postId}. Blocking further attempts.`);
       
       return safeResponse(res, {
         success: false,
-        message: `Post has reached the maximum number of processing attempts (5).`,
+        message: `Post has reached the maximum number of processing attempts (1).`,
         postId,
         executionId,
         maxExecutionsReached: true,
