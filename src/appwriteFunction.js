@@ -388,6 +388,127 @@ module.exports = async function(req, res) {
       log(`[${executionId}] Previous processing has been running for ${timeSinceStart}ms, resetting lock`);
     }
     
+    // НОВОЕ: Проверяем статус обработки в базе данных перед запуском
+    try {
+      log(`[${executionId}] Checking post processing status in database`);
+      const post = await databases.getDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        postId
+      );
+      
+      // Проверяем processing_status
+      if (post.processing_status === 'processing') {
+        // Проверяем, когда последний раз был обновлен пост
+        const updatedAt = new Date(post.$updatedAt);
+        const now = new Date();
+        const timeSinceUpdate = now - updatedAt;
+        
+        // Если обновление было менее 5 минут назад, считаем что обработка все еще идет
+        if (timeSinceUpdate < 5 * 60 * 1000) { // 5 минут в миллисекундах
+          log(`[${executionId}] Database indicates post ${postId} is being processed (last update ${Math.floor(timeSinceUpdate/1000)}s ago)`);
+          
+          // Не запускаем новую обработку, если статус 'processing'
+          return safeResponse(res, {
+            success: false,
+            message: `Post is currently being processed (status: 'processing', last update ${Math.floor(timeSinceUpdate/1000)}s ago)`,
+            postId,
+            executionId,
+            alreadyProcessing: true,
+            executionTime: `${Date.now() - startTime}ms`,
+            dbCheck: true
+          }, context, log, logError);
+        } else {
+          log(`[${executionId}] Found stale processing status from ${Math.floor(timeSinceUpdate/1000)}s ago, resetting to 'pending'`);
+          
+          // Если с последнего обновления прошло больше 5 минут, сбрасываем статус на 'pending'
+          try {
+            await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_COLLECTION_ID_POST,
+              postId,
+              {
+                processing_status: 'pending'
+              }
+            );
+            log(`[${executionId}] Reset processing_status to 'pending' for post ${postId}`);
+          } catch (resetError) {
+            logError(`[${executionId}] Error resetting processing_status:`, resetError);
+          }
+        }
+      }
+      
+      // Если статус 'completed', проверяем наличие обработанных файлов
+      if (post.processing_status === 'completed') {
+        log(`[${executionId}] Post ${postId} has processing_status 'completed'`);
+        
+        // Проверяем, чтобы mp3_url или m3u8_url были также установлены
+        if (post.mp3_url || post.m3u8_url) {
+          log(`[${executionId}] Post ${postId} already has processed audio: mp3_url=${!!post.mp3_url}, m3u8_url=${!!post.m3u8_url}`);
+          
+          return safeResponse(res, {
+            success: true,
+            message: 'Post already has processed audio',
+            postId,
+            executionId,
+            mp3_url: post.mp3_url,
+            m3u8_url: post.m3u8_url,
+            alreadyProcessed: true,
+            executionTime: `${Date.now() - startTime}ms`
+          }, context, log, logError);
+        } else {
+          // Если статус 'completed', но ссылок нет, сбрасываем статус
+          log(`[${executionId}] Post has status 'completed' but missing audio URLs, resetting to 'pending'`);
+          try {
+            await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_COLLECTION_ID_POST,
+              postId,
+              {
+                processing_status: 'pending'
+              }
+            );
+            log(`[${executionId}] Reset processing_status to 'pending' for post ${postId} due to missing audio URLs`);
+          } catch (resetError) {
+            logError(`[${executionId}] Error resetting processing_status:`, resetError);
+          }
+        }
+      }
+      
+      // Проверяем поле streaming_urls на наличие свежих записей о процессе обработки
+      if (Array.isArray(post.streaming_urls) && post.streaming_urls.length > 0) {
+        // Фильтруем записи о начале обработки
+        const processingEntries = post.streaming_urls.filter(url => {
+          if (typeof url !== 'string') return false;
+          return url.startsWith('processing-start:');
+        });
+        
+        if (processingEntries.length > 0) {
+          // Проверяем самую свежую запись (они отсортированы в порядке добавления)
+          const latestEntry = processingEntries[0]; // самая свежая запись находится в начале массива
+          
+          // Извлекаем время начала обработки из записи (формат: processing-start:executionId:timestamp:...)
+          const parts = latestEntry.split(':');
+          if (parts.length >= 3) {
+            try {
+              const processingStartTime = new Date(parts[2]);
+              const now = new Date();
+              const timeSinceStart = now - processingStartTime;
+              
+              // Логируем для информации, но не блокируем, если status не 'processing'
+              log(`[${executionId}] Found processing record from ${Math.floor(timeSinceStart/1000)}s ago (for info only)`);
+            } catch (e) {
+              logError(`[${executionId}] Error parsing processing start time:`, e);
+            }
+          }
+        }
+      }
+      
+    } catch (dbError) {
+      logError(`[${executionId}] Error checking post in database:`, dbError);
+      // Продолжаем выполнение, даже если проверка базы данных не удалась
+    }
+    
     // Логируем количество запусков для этого поста
     const currentCount = postExecutionCounts.get(postId) || 0;
     postExecutionCounts.set(postId, currentCount + 1);
@@ -574,6 +695,22 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
       console.log(`[${executionId}] Post ${postId} already has processed audio: mp3_url=${!!post.mp3_url}, m3u8_url=${!!post.m3u8_url}`);
       processingPosts.delete(postId);
       clearTimeout(clearLockTimeout);
+      
+      // НОВОЕ: Убедимся, что processing_status отмечен как 'completed'
+      try {
+        await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          postId,
+          {
+            processing_status: 'completed'
+          }
+        );
+        console.log(`[${executionId}] Updated processing_status to 'completed' for already processed post`);
+      } catch (e) {
+        console.error(`[${executionId}] Error updating processing_status for already processed post:`, e);
+      }
+      
       return {
         success: true,
         message: 'Post already has processed audio',
@@ -634,49 +771,44 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
         // Добавляем сообщение о начале обработки
         updatedDescription = updatedDescription ? `${updatedDescription}\n${processingMsg}` : processingMsg;
         
+        // НОВОЕ: Устанавливаем processing_status как 'processing'
+        const updateData = {
+          streaming_urls: updatedStreamingUrls,
+          processing_status: 'processing'  // Новое поле для отслеживания статуса
+        };
+        
         // Проверяем, что длина не превышает 999 символов
         if (updatedDescription && updatedDescription.length <= 999) {
-          await retryWithBackoff(async () => {
-            return await databases.updateDocument(
-              APPWRITE_DATABASE_ID,
-              APPWRITE_COLLECTION_ID_POST,
-              postId,
-              {
-                streaming_urls: updatedStreamingUrls,
-                description: updatedDescription
-              }
-            );
-          }, 5, 3000);
+          updateData.description = updatedDescription;
         } else {
-          // Если description слишком длинный, обновляем только streaming_urls
-          console.log(`[${executionId}] Description is too long (${updatedDescription?.length || 0} chars), updating only streaming_urls`);
-          await retryWithBackoff(async () => {
-            return await databases.updateDocument(
-              APPWRITE_DATABASE_ID,
-              APPWRITE_COLLECTION_ID_POST,
-              postId,
-              {
-                streaming_urls: updatedStreamingUrls
-              }
-            );
-          }, 5, 3000);
+          console.log(`[${executionId}] Description is too long (${updatedDescription?.length || 0} chars), not including in update`);
         }
+        
+        await retryWithBackoff(async () => {
+          return await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_COLLECTION_ID_POST,
+            postId,
+            updateData
+          );
+        }, 5, 3000);
         
         console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
       } catch (descError) {
         console.error(`[${executionId}] Error with description field:`, descError);
-        // Если ошибка связана с description, обновляем только streaming_urls
+        // Если ошибка связана с description, обновляем только streaming_urls и processing_status
         await retryWithBackoff(async () => {
           return await databases.updateDocument(
             APPWRITE_DATABASE_ID,
             APPWRITE_COLLECTION_ID_POST,
             postId,
             {
-              streaming_urls: updatedStreamingUrls
+              streaming_urls: updatedStreamingUrls,
+              processing_status: 'processing'
             }
           );
         }, 5, 3000);
-        console.log(`[${executionId}] Updated post with streaming_urls only due to description error`);
+        console.log(`[${executionId}] Updated post with streaming_urls and processing_status only due to description error`);
       }
     } catch (error) {
       console.error(`[${executionId}] Error updating post with processing start info:`, error);
@@ -696,30 +828,52 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
     
     console.log(`[${executionId}] Audio processing completed for post ${postId} with result:`, result);
     
-    return {
-      success: true,
-      message: 'Audio processing completed successfully',
-      executionId,
-      postId,
-      result,
-      processingTime: `${Date.now() - startTime}ms`,
-      source
-    };
+    // НОВОЕ: Обновляем статус обработки на 'completed' после успешного завершения
+    try {
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        postId,
+        {
+          processing_status: result.success ? 'completed' : 'failed'
+        }
+      );
+      console.log(`[${executionId}] Updated processing_status to '${result.success ? 'completed' : 'failed'}'`);
+    } catch (e) {
+      console.error(`[${executionId}] Error updating processing_status after completion:`, e);
+    }
     
+    return result;
   } catch (error) {
-    console.error(`[${executionId}] Error in simplified audio processing:`, error);
+    console.error(`[${executionId}] Error in simplifiedAudioProcessing:`, error);
     
     // Снимаем блокировку в случае ошибки
     processingPosts.delete(postId);
     clearTimeout(clearLockTimeout);
     
+    // НОВОЕ: Обновляем статус обработки на 'failed' в случае ошибки
+    try {
+      await databases.updateDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        postId,
+        {
+          processing_status: 'failed',
+          streaming_urls: Array.isArray(post?.streaming_urls) ? 
+            [`processing-error:${executionId}:${new Date().toISOString()}:${error.message}`, ...post.streaming_urls.slice(0, 19)] : 
+            [`processing-error:${executionId}:${new Date().toISOString()}:${error.message}`]
+        }
+      );
+      console.log(`[${executionId}] Updated processing_status to 'failed' due to error`);
+    } catch (e) {
+      console.error(`[${executionId}] Error updating processing_status after error:`, e);
+    }
+    
     return {
       success: false,
-      error: `Error processing audio: ${error.message}`,
+      error: error.message || 'Unknown error',
       postId,
-      executionId,
-      processingTime: `${Date.now() - startTime}ms`,
-      source: options.source || 'unknown'
+      executionId
     };
   }
 }
@@ -786,19 +940,24 @@ async function updateUIProgress(postId, databases, step, progress, status = 'pro
   try {
     const progressPercentage = getProgressPercentage(step, progress);
     
+    // Подготовка данных для обновления
+    const updateData = {
+      audio_processing_progress: progressPercentage,
+      audio_processing_step: step,
+      audio_processing_status: status,
+      audio_processing_updated_at: new Date().toISOString(),
+      // НОВОЕ: Обновляем также общий статус обработки
+      processing_status: status
+    };
+    
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
       postId,
-      {
-        audio_processing_progress: progressPercentage,
-        audio_processing_step: step,
-        audio_processing_status: status,
-        audio_processing_updated_at: new Date().toISOString()
-      }
+      updateData
     );
     
-    log(`Updated UI progress for post ${postId}: ${step} - ${progressPercentage}%`);
+    log(`Updated UI progress for post ${postId}: ${step} - ${progressPercentage}%, status: ${status}`);
     return true;
   } catch (error) {
     logError(`Failed to update UI progress for post ${postId}:`, error);
@@ -1620,17 +1779,31 @@ async function cleanupAndUpdateExecution(post, executionRecord, databases, succe
     // Обновляем статус обработки в документе поста вместо записи в отдельной коллекции
     if (post && post.$id) {
       try {
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
-          post.$id,
-          {
-            processing_status: success ? 'completed' : 'error',
-            processing_completed_at: new Date().toISOString(),
-            processing_error: errorMessage || null
-          }
-        );
-        console.log(`Post ${post.$id} updated with execution status`);
+        const updateData = {
+          processing_completed_at: new Date().toISOString(),
+          // НОВОЕ: используем общий формат статуса
+          processing_status: success ? 'completed' : 'failed',
+          // Добавляем запись в streaming_urls для логирования
+          streaming_urls: success 
+            ? [`processing-complete:${executionRecord?.$id || 'unknown'}:${new Date().toISOString()}`]
+            : [`processing-error:${executionRecord?.$id || 'unknown'}:${new Date().toISOString()}:${errorMessage || 'Unknown error'}`]
+        };
+        
+        // Добавляем сообщение об ошибке только если она есть
+        if (!success && errorMessage) {
+          updateData.processing_error = errorMessage;
+        }
+        
+        await retryWithBackoff(async () => {
+          return await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_COLLECTION_ID_POST,
+            post.$id,
+            updateData
+          );
+        }, 5, 3000);
+        
+        console.log(`Post ${post.$id} updated with execution status: ${success ? 'completed' : 'failed'}`);
       } catch (updateError) {
         console.error('Error updating post with execution status:', updateError);
       }
