@@ -11,6 +11,11 @@ const os = require('os');
 const ffmpeg = require('fluent-ffmpeg');
 const dotenv = require('dotenv');
 
+// Добавляем кеш для отслеживания обрабатываемых постов и предотвращения параллельной обработки
+const processingPosts = new Map();
+// Добавляем счетчик выполнений, чтобы отслеживать, сколько раз пост был обработан
+const postExecutionCounts = new Map();
+
 // Инициализируем dotenv для загрузки переменных окружения из .env файла (если он существует)
 dotenv.config();
 
@@ -239,10 +244,16 @@ function extractPostId(req, log, logError) {
 
 // Основная функция обработки, экспортируемая модулем
 module.exports = async function(req, res) {
+  // Создаем уникальный ID выполнения для логирования
+  const executionId = ID.unique();
+  const startTime = Date.now();
+  
   // Инициализируем объект payload заранее
   let payload = {};
   let postId = null;
   let context = null;
+  let source = 'unknown';
+  let isTest = false;
   
   // Проверяем, может быть у нас новый формат контекста Appwrite
   if (req && req.req && req.res) {
@@ -255,11 +266,11 @@ module.exports = async function(req, res) {
   const log = (context?.log || req?.log || console.log).bind(console);
   const logError = (context?.error || req?.error || console.error).bind(console);
   
-  log('Запуск функции обработки аудио');
+  log(`[${executionId}] Запуск функции обработки аудио`);
   
   try {
     // Логируем доступные ключи в req для отладки
-    log(`Request keys: ${req ? Object.keys(req).join(', ') : 'req is undefined'}`);
+    log(`[${executionId}] Request keys: ${req ? Object.keys(req).join(', ') : 'req is undefined'}`);
     
     // Получение и парсинг payload
     if (req && req.body) {
@@ -270,7 +281,7 @@ module.exports = async function(req, res) {
           payload = req.body;
         }
       } catch (e) {
-        logError('Error parsing request body:', e);
+        logError(`[${executionId}] Error parsing request body:`, e);
       }
     }
     
@@ -292,48 +303,137 @@ module.exports = async function(req, res) {
     }
     
     // Логируем ключи в payload для отладки
-    log(`Payload keys: ${Object.keys(payload).join(', ')}`);
+    log(`[${executionId}] Payload keys: ${Object.keys(payload).join(', ')}`);
+    
+    // Проверяем источник запроса
+    if (payload.source) {
+      source = payload.source;
+      log(`[${executionId}] Request source from payload: ${source}`);
+    }
+    
+    // Проверяем, является ли запрос тестовым
+    if (payload.isTest === true || payload.test === true) {
+      isTest = true;
+      log(`[${executionId}] Test request detected`);
+    }
+    
+    // Проверяем заголовки для определения источника
+    if (req.headers) {
+      const srcHeader = req.headers['x-source'] || req.headers['X-Source'];
+      if (srcHeader) {
+        source = srcHeader;
+        log(`[${executionId}] Request source from header: ${source}`);
+      }
+      
+      // Проверяем, является ли запрос тестовым по заголовку
+      const testHeader = req.headers['x-test'] || req.headers['X-Test'];
+      if (testHeader === 'true') {
+        isTest = true;
+        log(`[${executionId}] Test request detected from header`);
+      }
+    }
     
     // Получаем postId различными способами
     if (payload && payload.postId) {
       postId = payload.postId;
-      log(`Using postId from payload: ${postId}`);
+      log(`[${executionId}] Using postId from payload: ${postId}`);
     } else if (req) {
       // Пытаемся извлечь postId из других источников
-      postId = extractPostId(req, log, logError);
-      log(`Extracted postId: ${postId}`);
+      postId = extractPostId(req, 
+        (msg) => log(`[${executionId}] ${msg}`), 
+        (msg, err) => logError(`[${executionId}] ${msg}`, err)
+      );
+      log(`[${executionId}] Extracted postId: ${postId}`);
     }
     
     // Проверяем, что postId был найден
     if (!postId) {
-      log('No postId found in request');
+      log(`[${executionId}] No postId found in request`);
       
       // Формируем ответ
       const errorResponseNoPostId = {
         success: false,
-        message: 'No postId found in request'
+        message: 'No postId found in request',
+        executionId,
+        executionTime: `${Date.now() - startTime}ms`
       };
       
       // Безопасная отправка ответа, проверяем наличие методов ответа
       return safeResponse(res, errorResponseNoPostId, context, log, logError);
     }
     
-    // Остальная логика обработки запроса...
-    // Запускаем обработку аудио
-    const result = await simplifiedAudioProcessing(postId, null, databases, storage, client);
+    // НОВОЕ: Если функция уже выполняется для этого поста, избегаем запуска еще одного выполнения
+    if (processingPosts.has(postId)) {
+      const processingStartTime = processingPosts.get(postId);
+      const now = Date.now();
+      const timeSinceStart = now - processingStartTime;
+      
+      log(`[${executionId}] Post ${postId} is already being processed (started ${timeSinceStart}ms ago)`);
+      
+      // Если пост в процессе обработки менее 10 секунд, не запускаем новую обработку
+      if (timeSinceStart < 10000) {
+        log(`[${executionId}] Preventing duplicate execution as processing started ${timeSinceStart}ms ago`);
+        
+        return safeResponse(res, {
+          success: false,
+          message: `Audio processing is already in progress (started ${Math.floor(timeSinceStart/1000)}s ago)`,
+          postId,
+          executionId,
+          alreadyProcessing: true,
+          executionTime: `${Date.now() - startTime}ms`
+        }, context, log, logError);
+      }
+      
+      // Если процесс идет более 10 секунд, мы можем сбросить блокировку, возможно предыдущий процесс завис
+      log(`[${executionId}] Previous processing has been running for ${timeSinceStart}ms, resetting lock`);
+    }
+    
+    // Логируем количество запусков для этого поста
+    const currentCount = postExecutionCounts.get(postId) || 0;
+    postExecutionCounts.set(postId, currentCount + 1);
+    log(`[${executionId}] Starting execution #${currentCount + 1} for post ${postId}`);
+    
+    // Устанавливаем блокировку для обработки этого поста
+    processingPosts.set(postId, Date.now());
+    
+    // Запускаем обработку аудио с указанием источника
+    log(`[${executionId}] Initializing audio processing for post ${postId} from source: ${source}`);
+    const result = await simplifiedAudioProcessing(postId, null, databases, storage, client, {
+      source,
+      isTest
+    });
+    
+    // Логируем результат
+    log(`[${executionId}] Processing completed with result: ${JSON.stringify(result)}`);
+    
+    // Добавляем информацию о выполнении
+    result.executionId = executionId;
+    result.executionTime = `${Date.now() - startTime}ms`;
     
     // Безопасно отправляем ответ
     return safeResponse(res, result, context, log, logError);
     
   } catch (error) {
-    logError('Error in main function:', error);
+    logError(`[${executionId}] Error in main function:`, error);
+    
+    // Если у нас есть postId, снимаем блокировку
+    if (postId) {
+      processingPosts.delete(postId);
+      log(`[${executionId}] Removed processing lock for post ${postId} due to error`);
+    }
     
     // Безопасно отправляем ошибку
     const errorResponse = {
       success: false,
       error: error.message || 'Unknown error',
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      postId,
+      executionId,
+      executionTime: `${Date.now() - startTime}ms`
     };
+    
+    if (process.env.NODE_ENV === 'development') {
+      errorResponse.stack = error.stack;
+    }
     
     return safeResponse(res, errorResponse, context, log, logError);
   }
@@ -393,136 +493,182 @@ function safeResponse(res, data, context, log, logError) {
   }
 }
 
-// Упрощенная версия обработки аудио, делающая минимальное количество API-запросов
-async function simplifiedAudioProcessing(postId, existingPostData, databases, storage, client) {
+/**
+ * Упрощенная версия функции обработки аудио для одного поста
+ * @param {string} postId - ID поста для обработки
+ * @param {Object|null} providedPost - Объект поста (если уже получен)
+ * @param {Object} databases - Объект для работы с базами данных
+ * @param {Object} storage - Объект для работы с хранилищем
+ * @param {Object} client - Клиент Appwrite
+ * @param {Object} options - Дополнительные опции
+ */
+async function simplifiedAudioProcessing(postId, providedPost = null, databases, storage, client, options = {}) {
+  // Уникальный ID выполнения для логирования
   const executionId = ID.unique();
-  const log = (message) => console.log(`[${executionId}] ${message}`);
+  const startTime = Date.now();
   
+  // Дополнительные опции запуска
+  const { source = 'unknown', isTest = false } = options;
+
+  // Очищаем блокировку по завершении через 10 секунд (механизм безопасности)
+  const clearLockTimeout = setTimeout(() => {
+    if (processingPosts.has(postId)) {
+      processingPosts.delete(postId);
+      console.log(`[${executionId}] Cleared processing lock for post ${postId} (auto-timeout)`);
+    }
+  }, 10000);
+
   try {
-    log(`Starting audio processing for post ${postId}`);
+    console.log(`[${executionId}] Starting simplified audio processing for post ${postId} from source: ${source}`);
     
-    // Получаем данные поста только если они еще не переданы
-    const post = existingPostData || await retryWithBackoff(async () => {
-      return await databases.getDocument(
+    // Проверка источника запроса - разрешаем только Sacral Track или тестовые запуски
+    const allowedSources = ['sacral_track', 'appwrite_webhook', 'direct_test'];
+    if (!isTest && !allowedSources.includes(source)) {
+      console.log(`[${executionId}] Rejected processing request from unauthorized source: ${source}`);
+      processingPosts.delete(postId);
+      clearTimeout(clearLockTimeout);
+      return {
+        success: false,
+        message: 'Processing request rejected: unauthorized source',
+        postId,
+        executionId,
+        source
+      };
+    }
+    
+    // Используем предоставленный пост или загружаем его из базы данных
+    let post = providedPost;
+    
+    if (!post) {
+      console.log(`[${executionId}] Retrieving post ${postId} from database`);
+      post = await databases.getDocument(
         APPWRITE_DATABASE_ID,
         APPWRITE_COLLECTION_ID_POST,
         postId
       );
-    });
+      console.log(`[${executionId}] Successfully retrieved post ${post.$id}`);
+    }
     
-    log(`Retrieved post ${post.$id}`);
-    
-    // ВАЖНО: Проверка на частые выполнения, чтобы избежать бесконечного цикла
-    const recentExecutions = (post.streaming_urls || []).filter(url => 
-      typeof url === 'string' &&
-      (url.startsWith('processing-start:') || url.startsWith('processing:')) && 
-      new Date(url.split(':')[2]) > new Date(Date.now() - 3600000) // За последний час
-    );
-    
-    if (recentExecutions.length >= 5) {
-      log(`Обнаружено слишком много недавних выполнений (${recentExecutions.length}) для поста ${postId}, прерываем обработку`);
+    // Проверка наличия URL аудио
+    if (!post.audio_url) {
+      console.log(`[${executionId}] Post ${postId} does not have an audio URL`);
+      processingPosts.delete(postId);
+      clearTimeout(clearLockTimeout);
       return {
         success: false,
-        message: 'Слишком много недавних выполнений, прерываем для предотвращения бесконечного цикла',
-        postId
+        message: 'Post does not have an audio URL to process',
+        postId,
+        executionId
       };
     }
     
-    // Проверяем, было ли запущено выполнение в течение последних 30 секунд
-    const veryRecentExecutions = recentExecutions.filter(
-      url => new Date(url.split(':')[2]) > new Date(Date.now() - 30000) // За последние 30 секунд
-    );
-    
-    if (veryRecentExecutions.length > 0) {
-      log(`Обнаружено выполнение, начатое менее 30 секунд назад для поста ${postId}, прерываем дублирование`);
-      return {
-        success: false,
-        message: 'Обработка уже начата менее 30 секунд назад, предотвращаем дублирование',
-        postId
-      };
-    }
-    
-    // Проверяем, есть ли уже обработанное аудио
+    // Проверка наличия уже обработанного аудио
     if (post.mp3_url || post.m3u8_url) {
-      log(`Post ${postId} already has processed audio`);
+      console.log(`[${executionId}] Post ${postId} already has processed audio: mp3_url=${!!post.mp3_url}, m3u8_url=${!!post.m3u8_url}`);
+      processingPosts.delete(postId);
+      clearTimeout(clearLockTimeout);
       return {
         success: true,
         message: 'Post already has processed audio',
-        postId
+        postId,
+        executionId,
+        mp3_url: post.mp3_url,
+        m3u8_url: post.m3u8_url,
+        alreadyProcessed: true
       };
     }
     
-    // Проверяем наличие URL аудио
-    if (!post.audio_url) {
-      log(`Post ${postId} does not have an audio URL`);
-      return {
-        success: false,
-        message: 'Post does not have an audio URL',
-        postId
-      };
+    // Логируем существующие streaming_urls для диагностики
+    // Только для информации, не используем для ограничений
+    try {
+      const streamingUrls = post.streaming_urls || [];
+      console.log(`[${executionId}] Current streaming_urls: ${JSON.stringify(streamingUrls)}`);
+      
+      // Фильтруем только записи о процессе обработки для логирования
+      const processingEntries = streamingUrls.filter(url => {
+        if (typeof url !== 'string') {
+          return false;
+        }
+        return url.startsWith('processing-start:') || url.startsWith('processing:');
+      });
+      
+      console.log(`[${executionId}] Found ${processingEntries.length} previous processing entries (for info only)`);
+    } catch (e) {
+      console.error(`[${executionId}] Error while checking previous executions:`, e);
+      // Не прекращаем выполнение в случае ошибки проверки
     }
     
     // Обновляем пост с информацией о начале обработки
-    // Используем всего ОДИН запрос на обновление
-    await retryWithBackoff(async () => {
-      return await databases.updateDocument(
-        APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
-        postId,
-        {
-          streaming_urls: [`processing-start:${executionId}:${new Date().toISOString()}`],
-          // Используем поле description для хранения статуса
-          description: post.description ? 
-            `${post.description}\n[Processing started]` : 
-            '[Processing started]'
-        }
-      );
-    }, 5, 3000); // Увеличиваем время ожидания и количество попыток
-    
-    log(`Updated post ${postId} to mark as processing`);
-    
-    // Начинаем обработку аудио с помощью отдельного процесса или задачи
-    // чтобы не делать слишком много API-запросов в одной функции
-    
-    // Вместо множества последовательных обновлений в базе данных,
-    // мы просто инициируем процесс и возвращаем успешный результат
-    
-    // Этот код может быть расширен для запуска отдельной задачи или
-    // процесса через другой механизм (например, очередь сообщений)
-    
-    // Для демонстрации мы просто возвращаем успешный результат
-    return { 
-      success: true, 
-      message: 'Simplified audio processing initiated to avoid rate limiting', 
-      executionId,
-      postId
-    };
-    
-  } catch (error) {
-    console.error('Error in simplified audio processing:', error);
-    
-    // Пытаемся обновить пост с информацией об ошибке - только одна попытка
     try {
+      const newStreamingUrl = `processing-start:${executionId}:${new Date().toISOString()}:source=${source}`;
+      console.log(`[${executionId}] Updating post with processing start info: ${newStreamingUrl}`);
+      
+      // Тип streaming_urls должен быть массивом
+      let updatedStreamingUrls = [];
+      
+      if (Array.isArray(post.streaming_urls)) {
+        // Оставляем только последние 20 записей для предотвращения переполнения
+        updatedStreamingUrls = [newStreamingUrl, ...post.streaming_urls.slice(0, 19)];
+      } else {
+        updatedStreamingUrls = [newStreamingUrl];
+      }
+      
       await retryWithBackoff(async () => {
         return await databases.updateDocument(
           APPWRITE_DATABASE_ID,
           APPWRITE_COLLECTION_ID_POST,
           postId,
           {
-            description: `Error processing audio: ${error.message}`,
-            streaming_urls: [`error:${error.message}:${new Date().toISOString()}`]
+            streaming_urls: updatedStreamingUrls,
+            description: post.description ? 
+              `${post.description}\n[Processing started at ${new Date().toISOString()} from ${source}]` : 
+              `[Processing started at ${new Date().toISOString()} from ${source}]`
           }
         );
-      }, 3, 5000); // Длительная задержка и меньше попыток
-      console.log(`Updated post ${postId} with error status`);
-    } catch (updateError) {
-      console.error('Could not update error status due to rate limiting', updateError);
+      }, 5, 3000);
+      
+      console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
+    } catch (error) {
+      console.error(`[${executionId}] Error updating post with processing start info:`, error);
+      // Не прекращаем выполнение в случае ошибки обновления
     }
+    
+    // Выполняем обработку аудио в отдельном процессе
+    console.log(`[${executionId}] Starting actual audio processing for post ${postId}`);
+    
+    // Здесь выполняется фактическая обработка аудио
+    const result = await processAudio(postId, post.audio_url, executionId);
+    
+    // Снимаем блокировку после завершения
+    processingPosts.delete(postId);
+    clearTimeout(clearLockTimeout);
+    
+    console.log(`[${executionId}] Audio processing completed for post ${postId} with result:`, result);
+    
+    return {
+      success: true,
+      message: 'Audio processing completed successfully',
+      executionId,
+      postId,
+      result,
+      processingTime: `${Date.now() - startTime}ms`,
+      source
+    };
+    
+  } catch (error) {
+    console.error(`[${executionId}] Error in simplified audio processing:`, error);
+    
+    // Снимаем блокировку в случае ошибки
+    processingPosts.delete(postId);
+    clearTimeout(clearLockTimeout);
     
     return {
       success: false,
-      message: `Error processing audio: ${error.message}`,
-      postId
+      error: `Error processing audio: ${error.message}`,
+      postId,
+      executionId,
+      processingTime: `${Date.now() - startTime}ms`,
+      source: options.source || 'unknown'
     };
   }
 }
