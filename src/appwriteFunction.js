@@ -521,9 +521,16 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
   try {
     console.log(`[${executionId}] Starting simplified audio processing for post ${postId} from source: ${source}`);
     
-    // Проверка источника запроса - разрешаем только Sacral Track или тестовые запуски
-    const allowedSources = ['sacral_track', 'appwrite_webhook', 'direct_test'];
-    if (!isTest && !allowedSources.includes(source)) {
+    // Проверка источника запроса - разрешаем Sacral Track, тестовые запуски и прямые запросы
+    const allowedSources = ['sacral_track', 'appwrite_webhook', 'direct_test', 'unknown', 'appwrite', 'function'];
+    
+    // Временно отключаем проверку источника, если isTest не явно указан как true
+    // Это позволит любым запросам проходить, пока мы тестируем
+    if (process.env.DISABLE_SOURCE_CHECK === 'true' || process.env.NODE_ENV === 'development') {
+      console.log(`[${executionId}] Source check disabled in development mode or by env var`);
+    }
+    // Проверка только если включена и не тестовый режим
+    else if (!isTest && !allowedSources.includes(source)) {
       console.log(`[${executionId}] Rejected processing request from unauthorized source: ${source}`);
       processingPosts.delete(postId);
       clearTimeout(clearLockTimeout);
