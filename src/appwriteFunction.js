@@ -2,7 +2,7 @@
 // Optimized for direct calls from Sacral Track application
 
 // Заменяем импорты ES модулей на CommonJS синтаксис
-const { Client, Databases, Storage, ID, Query } = require('node-appwrite');
+const { Client, Databases, Storage, ID, Query, InputFile, Teams, Functions } = require('node-appwrite');
 const axios = require('axios');
 const path = require('path');
 const fs = require('fs');
@@ -381,6 +381,33 @@ module.exports = async function(req, res) {
     
     // НОВОЕ: Если это запрос на продолжение обработки, пропускаем некоторые проверки
     if (isContinuation) {
+      log(`[${executionId}] Skipping processing lock checks for continuation request`);
+      
+      // ВАЖНО: Проверка задержки - если запрос содержит delay_seconds и scheduled_at
+      if (payload.delay_seconds && payload.scheduled_at) {
+        const scheduledAt = new Date(payload.scheduled_at);
+        const expectedExecutionTime = new Date(payload.expected_execution_time || scheduledAt);
+        expectedExecutionTime.setSeconds(expectedExecutionTime.getSeconds() + (payload.delay_seconds || 0));
+        
+        const now = new Date();
+        const timeDiff = now - expectedExecutionTime;
+        
+        // Если выполнение происходит раньше ожидаемого времени, выходим
+        if (timeDiff < -1000) { // Запускаем, только если прошло необходимое время (с буфером 1с)
+          log(`[${executionId}] Continuation execution time not reached yet. Expected: ${expectedExecutionTime.toISOString()}, Current: ${now.toISOString()}`);
+          return safeResponse(res, {
+            success: false, 
+            message: `Continuation scheduled for future execution at ${expectedExecutionTime.toISOString()}`,
+            isContinuation: true,
+            executionId: continuationExecutionId || executionId,
+            tooEarly: true,
+            executionTime: `${Date.now() - startTime}ms`
+          }, context, log, logError);
+        }
+        
+        log(`[${executionId}] Continuation delay passed, proceeding with execution`);
+      }
+      
       log(`[${executionId}] Skipping processing lock checks for continuation request`);
       
       try {
@@ -904,17 +931,21 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
     
     console.log(`[${executionId}] Audio processing completed for post ${postId} with result:`, result);
     
-    // НОВОЕ: Обновляем статус обработки на 'completed' после успешного завершения
+    // ИСПРАВЛЕНО: НЕ обновляем статус на 'completed' после первого шага,
+    // так как это только запуск процесса, а не его завершение
     try {
       await databases.updateDocument(
         APPWRITE_DATABASE_ID,
         APPWRITE_COLLECTION_ID_POST,
         postId,
         {
-          processing_status: result.success ? 'completed' : 'failed'
+          // Обновляем статус в зависимости от этапа и результата
+          processing_status: result.success ? 
+            (result.alreadyProcessed ? 'completed' : 'processing') : 
+            'failed'
         }
       );
-      console.log(`[${executionId}] Updated processing_status to '${result.success ? 'completed' : 'failed'}'`);
+      console.log(`[${executionId}] Updated processing_status to '${result.success ? (result.alreadyProcessed ? 'completed' : 'processing') : 'failed'}'`);
     } catch (e) {
       console.error(`[${executionId}] Error updating processing_status after completion:`, e);
     }
@@ -1524,7 +1555,10 @@ async function scheduleContinuationTask(postId, post, executionId, delaySeconds 
     const streamingUrls = post?.streaming_urls || [];
     streamingUrls.push(continuationInfo);
     
-    // Обновляем пост с новой информацией о продолжении
+    // УЛУЧШЕНО: Добавляем блокировку в специальном поле,
+    // чтобы предотвратить множественные запуски
+    // Устанавливаем точное время следующего шага
+    const nextStepTime = new Date(Date.now() + (delaySeconds * 1000 + 1000)); // +1 сек буфер
     await databases.updateDocument(
       APPWRITE_DATABASE_ID,
       APPWRITE_COLLECTION_ID_POST,
@@ -1532,65 +1566,62 @@ async function scheduleContinuationTask(postId, post, executionId, delaySeconds 
       { 
         streaming_urls: streamingUrls,
         processing_continuation_scheduled: true,
-        processing_next_step_at: new Date(Date.now() + (delaySeconds * 1000)).toISOString()
+        processing_continuation_lock: executionId, // Добавляем блокировку
+        processing_next_step_at: nextStepTime.toISOString(),
+        processing_continuation_source: 'function' // Указываем источник планирования
       }
     );
     
-    // НОВОЕ: Реально планируем следующий шаг с помощью Appwrite Client SDK
+    // УЛУЧШЕНО: Делаем один запрос сразу, без таймера, но с параметром delay
+    // Это надежнее в serverless-окружении, где таймеры ненадежны
     try {
-      // Создаем таймаут, который выполнится через указанное количество секунд
-      setTimeout(async () => {
-        try {
-          log(`[scheduleContinuationTask] Executing continuation task for post ${postId}`);
-          
-          // Создаем вызов к API для продолжения обработки
-          const endpoint = `${process.env.APPWRITE_FUNCTION_ENDPOINT}/functions/${process.env.APPWRITE_FUNCTION_ID}/executions`;
-          
-          // Подготавливаем данные для выполнения
-          const payload = {
-            id: postId,
-            execution_id: executionId,
-            continuation: true
-          };
-          
-          // Если client доступен и есть метод call
-          if (client && client.functions && typeof client.functions.createExecution === 'function') {
-            // Вызываем функцию через клиент Appwrite
-            const execution = await client.functions.createExecution(
-              process.env.APPWRITE_FUNCTION_ID,
-              JSON.stringify(payload),
-              false, // isAsync
-              '', // path
-              'POST', // method
-              {} // headers
-            );
-            
-            log(`[scheduleContinuationTask] Successfully executed continuation, execution ID: ${execution.$id}`);
-          } else {
-            // Если клиента нет, используем вызов по HTTP
-            const response = await fetch(endpoint, {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'X-Appwrite-Key': process.env.APPWRITE_API_KEY
-              },
-              body: JSON.stringify({
-                data: JSON.stringify(payload),
-                async: false
-              })
-            });
-            
-            const result = await response.json();
-            log(`[scheduleContinuationTask] Continuation task executed via HTTP, result: ${JSON.stringify(result)}`);
-          }
-        } catch (execError) {
-          logError(`[scheduleContinuationTask] Error during continuation execution: ${execError.message}`, execError);
-        }
-      }, delaySeconds * 1000);
+      log(`[scheduleContinuationTask] Creating continuation execution for post ${postId} with delay ${delaySeconds}s`);
       
-      log(`[scheduleContinuationTask] Continuation task scheduled for post ${postId} to execute in ${delaySeconds} seconds`);
+      // Создаем вызов к API для продолжения обработки
+      const endpoint = `${process.env.APPWRITE_FUNCTION_ENDPOINT}/functions/${process.env.APPWRITE_FUNCTION_ID}/executions`;
+      
+      // Подготавливаем данные для выполнения
+      const payload = {
+        id: postId,
+        execution_id: executionId,
+        continuation: true,
+        delay_seconds: delaySeconds,
+        scheduled_at: new Date().toISOString(),
+        expected_execution_time: nextStepTime.toISOString()
+      };
+      
+      // Если client доступен и есть метод call
+      if (client && client.functions && typeof client.functions.createExecution === 'function') {
+        // Вызываем функцию через клиент Appwrite
+        const execution = await client.functions.createExecution(
+          process.env.APPWRITE_FUNCTION_ID,
+          JSON.stringify(payload),
+          true, // isAsync - ВАЖНО: меняем на true для асинхронного выполнения
+          '', // path
+          'POST', // method
+          {} // headers
+        );
+        
+        log(`[scheduleContinuationTask] Successfully scheduled continuation, execution ID: ${execution.$id}`);
+      } else {
+        // Если клиента нет, используем вызов по HTTP
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Appwrite-Key': process.env.APPWRITE_API_KEY
+          },
+          body: JSON.stringify({
+            data: JSON.stringify(payload),
+            async: true // ВАЖНО: меняем на true для асинхронного выполнения
+          })
+        });
+        
+        const result = await response.json();
+        log(`[scheduleContinuationTask] Continuation task scheduled via HTTP, result: ${JSON.stringify(result)}`);
+      }
     } catch (schedulingError) {
-      logError(`[scheduleContinuationTask] Error scheduling actual continuation: ${schedulingError.message}`);
+      logError(`[scheduleContinuationTask] Error scheduling continuation: ${schedulingError.message}`);
     }
     
     // Возвращаем успешный результат
@@ -2110,7 +2141,7 @@ async function processAudio(postId, databases, storage, client, executionId = nu
   const logError = (message, err) => console.error(`[${executionRecord.$id}] ${message}`, err);
   
   try {
-    log(`Starting audio processing for post ${postId}`);
+    log(`Starting complete audio processing for post ${postId}`);
     
     // Validate post ID
     if (!postId) {
@@ -2158,161 +2189,323 @@ async function processAudio(postId, databases, storage, client, executionId = nu
       };
     }
     
-    // Check if we should start a new execution
-    if (!executionId) {
-      const shouldStart = await shouldStartNewExecution(postId, databases);
-      if (!shouldStart) {
-        log(`Too many recent executions for post ${postId}, skipping`);
-        return {
-          success: false,
-          message: 'Too many recent executions for this post, try again later',
-          postId
-        };
-      }
-      log(`Starting new execution for post ${postId}`);
+    // НОВОЕ: Вместо разделения обработки на шаги с продолжениями, 
+    // выполняем все шаги последовательно в одном вызове функции
+    
+    // Шаг 1: INITIALIZE - обновляем статус и подготавливаемся к обработке
+    log(`Initializing processing for post ${postId}`);
+    
+    // Проверяем, есть ли у поста корректный аудио URL
+    if (!post.audio_url) {
+      throw new Error('Post does not have a valid audio URL');
     }
     
-    // Определяем, используется ли уже аудио
-    let currentStep = PROCESSING_STEPS.INITIALIZE;
+    // Обновляем статус обработки в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        processing_status: 'processing',
+        audio_processing_progress: 5,
+        streaming_urls: [`processing-step:initialize:${executionRecord.$id}:${new Date().toISOString()}`]
+      }
+    );
     
-    // INITIALIZE step (check if post has unprocessed audio)
-    if (currentStep === PROCESSING_STEPS.INITIALIZE) {
-      log(`Initializing processing for post ${postId}`);
-      
-      // Проверяем, есть ли у поста уже обработанное аудио (mp3_url или m3u8_url)
-      if (post.mp3_url || post.m3u8_url) {
-        log(`Post ${postId} already has processed audio`);
-        return {
-          success: true,
-          message: 'Post already has processed audio',
-          postId
-        };
+    // Обновляем прогресс UI
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.INITIALIZE, 100);
+    
+    // Шаг 2: DOWNLOAD - загружаем аудио файл
+    log(`Starting download step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:download:${executionRecord.$id}:${new Date().toISOString()}`]
       }
-      
-      // Check if the post has a valid audio URL
-      if (!post.audio_url) {
-        log(`Post ${postId} does not have an audio URL`);
-        return {
-          success: false,
-          message: 'Post does not have an audio URL',
-          postId
-        };
+    );
+    
+    // Создаем временную директорию для файлов
+    const tempDir = path.join(os.tmpdir(), `audio-processing-${postId}-${Date.now()}`);
+    fs.mkdirSync(tempDir, { recursive: true });
+    log(`Created temporary directory: ${tempDir}`);
+    
+    // Загружаем аудио файл
+    const audioUrl = post.audio_url;
+    const audioFileName = `original-${Date.now()}.mp3`;
+    const audioFilePath = path.join(tempDir, audioFileName);
+    
+    log(`Downloading audio from ${audioUrl}`);
+    
+    // Загружаем файл используя axios или аналогичную библиотеку
+    const response = await axios({
+      method: 'get',
+      url: audioUrl,
+      responseType: 'stream'
+    });
+    
+    const writer = fs.createWriteStream(audioFilePath);
+    response.data.pipe(writer);
+    
+    // Ждем загрузки файла
+    await new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    });
+    
+    log(`Audio downloaded to ${audioFilePath}`);
+    
+    // Обновляем прогресс UI
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.DOWNLOAD, 100);
+    
+    // Шаг 3: CONVERT - конвертируем аудио файл в нужный формат
+    log(`Starting convert step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:convert:${executionRecord.$id}:${new Date().toISOString()}`]
       }
+    );
+    
+    // Путь для конвертированного MP3
+    const mp3OutputPath = path.join(tempDir, `converted-${Date.now()}.mp3`);
+    
+    // Выполняем конвертацию с помощью ffmpeg
+    log(`Converting audio to MP3`);
+    
+    // Конвертируем в MP3
+    await new Promise((resolve, reject) => {
+      ffmpeg(audioFilePath)
+        .outputOptions('-c:a', 'libmp3lame', '-b:a', '128k')
+        .output(mp3OutputPath)
+        .on('end', () => {
+          log(`Successfully converted to MP3: ${mp3OutputPath}`);
+          resolve();
+        })
+        .on('error', (err) => {
+          logError(`Error converting to MP3:`, err);
+          reject(err);
+        })
+        .run();
+    });
+    
+    // Обновляем прогресс UI
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.CONVERT, 100);
+    
+    // Шаг 4: SEGMENT - создаем сегменты для HLS
+    log(`Starting segment step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:segment:${executionRecord.$id}:${new Date().toISOString()}`]
+      }
+    );
+    
+    // Создаем директорию для HLS файлов
+    const hlsDir = path.join(tempDir, 'hls');
+    fs.mkdirSync(hlsDir, { recursive: true });
+    
+    // Пути для HLS файлов
+    const hlsBaseName = `stream-${Date.now()}`;
+    const m3u8Path = path.join(hlsDir, `${hlsBaseName}.m3u8`);
+    
+    // Создаем HLS сегменты
+    log(`Creating HLS segments in ${hlsDir}`);
+    
+    await new Promise((resolve, reject) => {
+      ffmpeg(mp3OutputPath)
+        .outputOptions(
+          '-c:a', 'aac',
+          '-b:a', '128k',
+          '-f', 'hls',
+          '-hls_time', '10', // 10-секундные сегменты
+          '-hls_list_size', '0', // Все сегменты в плейлисте
+          '-hls_segment_filename', path.join(hlsDir, `${hlsBaseName}_%03d.ts`)
+        )
+        .output(m3u8Path)
+        .on('end', () => {
+          log(`Successfully created HLS segments at ${m3u8Path}`);
+          resolve();
+        })
+        .on('error', (err) => {
+          logError(`Error creating HLS segments:`, err);
+          reject(err);
+        })
+        .run();
+    });
+    
+    // Обновляем прогресс UI
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.SEGMENT, 100);
+    
+    // Шаг 5: UPLOAD_SEGMENTS - загружаем сегменты в хранилище
+    log(`Starting upload segments step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:upload_segments:${executionRecord.$id}:${new Date().toISOString()}`]
+      }
+    );
+    
+    // Получаем список всех файлов сегментов
+    const segmentFiles = fs.readdirSync(hlsDir)
+      .filter(file => file.endsWith('.ts') || file.endsWith('.m3u8'));
+    
+    log(`Found ${segmentFiles.length} segments to upload`);
+    
+    // Загружаем MP3 файл в хранилище
+    log(`Uploading MP3 file to storage`);
+    const mp3FileContent = await fsReadFile(mp3OutputPath);
+    const mp3FileName = `${post.$id}-${Date.now()}.mp3`;
+    
+    const mp3Upload = await storage.createFile(
+      APPWRITE_BUCKET_ID,
+      ID.unique(),
+      InputFile.fromBuffer(mp3FileContent, mp3FileName)
+    );
+    
+    const mp3Url = storage.getFileView(APPWRITE_BUCKET_ID, mp3Upload.$id);
+    log(`MP3 uploaded, URL: ${mp3Url}`);
+    
+    // Загружаем все сегменты в хранилище
+    const uploadedSegments = [];
+    for (const segmentFile of segmentFiles) {
+      const segmentPath = path.join(hlsDir, segmentFile);
+      const fileContent = await fsReadFile(segmentPath);
       
-      // Update post to mark as processing - используем существующие поля с retry логикой
-      await safeUpdateDocument(
-        databases,
-        APPWRITE_DATABASE_ID,
-        APPWRITE_COLLECTION_ID_POST,
-        postId,
-        {
-          // Используем поле streaming_urls для хранения информации о процессе
-          streaming_urls: [`processing:${executionRecord.$id}:${new Date().toISOString()}`],
-          // НОВОЕ: Добавляем поле processing_status
-          processing_status: 'processing'
-        }
+      const segmentUpload = await storage.createFile(
+        APPWRITE_BUCKET_ID,
+        ID.unique(),
+        InputFile.fromBuffer(fileContent, segmentFile)
       );
       
-      log(`Updated post ${postId} to mark as processing`);
+      const segmentUrl = storage.getFileView(APPWRITE_BUCKET_ID, segmentUpload.$id);
       
-      // Update to next step
-      await manageProcessingExecution(post, PROCESSING_STEPS.DOWNLOAD, databases, client, {
-        executionId: executionRecord.$id,
-        progressData: {
-          startedAt: new Date().toISOString(),
-          audioUrl: post.audio_url
-        }
+      uploadedSegments.push({
+        id: segmentUpload.$id,
+        name: segmentFile,
+        url: segmentUrl
       });
       
-      return { 
-        success: true, 
-        message: 'Initialized processing, moving to download step', 
-        executionId: executionRecord.$id,
-        postId,
-        currentStep: PROCESSING_STEPS.DOWNLOAD
-      };
-    }
-    
-    // DOWNLOAD step (download the audio file)
-    if (currentStep === PROCESSING_STEPS.DOWNLOAD) {
-      return await processContinuationDownload(post, { body: {} }, { json: () => {} }, databases, storage, executionRecord, startTime);
-    }
-    
-    // CONVERT step (convert the audio file)
-    if (currentStep === PROCESSING_STEPS.CONVERT) {
-      return await processContinuationFFmpeg(post, { body: {} }, { json: () => {} }, databases, storage, executionRecord, startTime);
-    }
-    
-    // SEGMENT step (segment the audio file)
-    if (currentStep === PROCESSING_STEPS.SEGMENT) {
-      return await processContinuationPlaylistPreparation(post, { body: {} }, { json: () => {} }, databases, storage, executionRecord, startTime);
-    }
-    
-    // UPLOAD_SEGMENTS step (upload segments to storage)
-    if (currentStep === PROCESSING_STEPS.UPLOAD_SEGMENTS) {
-      return await processContinuationSegmentUpload(post, { body: {} }, { json: () => {} }, databases, storage, executionRecord, startTime);
-    }
-    
-    // CREATE_PLAYLIST step (create playlist from segments)
-    if (currentStep === PROCESSING_STEPS.CREATE_PLAYLIST) {
-      return await processContinuationPlaylistCreation(post, { body: {} }, { json: () => {} }, databases, storage, executionRecord, startTime);
-    }
-    
-    // FINALIZE step (finalize the processing)
-    if (currentStep === PROCESSING_STEPS.FINALIZE) {
-      log(`Finalizing processing for post ${postId}`);
+      log(`Uploaded segment ${segmentFile}, URL: ${segmentUrl}`);
       
-      try {
-        // Update post with processed flag
-        await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
-          postId,
-          {
-            audio_processed: true,
-            audio_processing: false,
-            audio_processed_at: new Date().toISOString(),
-            audio_progress_data: {
-              ...progressData,
-              completedAt: new Date().toISOString(),
-              status: 'completed'
-            }
-          }
-        );
-        
-        log(`Updated post ${postId} to mark as processed`);
-        
-        // Clean up temporary files
-        await cleanupAndUpdateExecution(post, executionRecord, databases, true);
-        
-        return {
-          success: true,
-          message: 'Audio processing completed successfully',
-          postId,
-          executionId: executionRecord.$id
-        };
-      } catch (finalizeError) {
-        logError('Error finalizing processing:', finalizeError);
-        
-        // Update execution record with error
-        await cleanupAndUpdateExecution(post, executionRecord, databases, false, finalizeError.message);
-        
-        return { 
-          success: false, 
-          message: `Error finalizing processing: ${finalizeError.message}`,
-          postId,
-          executionId: executionRecord.$id
-        };
-      }
+      // Обновляем прогресс загрузки
+      const progress = Math.min(
+        75 + Math.floor((uploadedSegments.length / segmentFiles.length) * 20),
+        94
+      );
+      await updateUIProgress(postId, databases, PROCESSING_STEPS.UPLOAD_SEGMENTS, progress);
     }
     
-    // Invalid step
-    throw new Error(`Invalid processing step: ${currentStep}`);
+    // Обновляем прогресс UI после завершения загрузки
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.UPLOAD_SEGMENTS, 100);
+    
+    // Шаг 6: CREATE_PLAYLIST - создаем и обновляем плейлист
+    log(`Starting create playlist step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:create_playlist:${executionRecord.$id}:${new Date().toISOString()}`]
+      }
+    );
+    
+    // Получаем и модифицируем содержимое плейлиста .m3u8
+    const m3u8Content = await fsReadFile(m3u8Path, 'utf8');
+    
+    // Находим все .ts сегменты в плейлисте
+    const tsSegments = uploadedSegments.filter(s => s.name.endsWith('.ts'));
+    
+    // Создаем новый плейлист с обновленными URL-ами сегментов
+    let modifiedM3u8 = m3u8Content;
+    for (const segment of tsSegments) {
+      const segmentFileName = segment.name;
+      const segmentUrl = segment.url;
+      modifiedM3u8 = modifiedM3u8.replace(segmentFileName, segmentUrl);
+    }
+    
+    // Загружаем модифицированный плейлист
+    const playlistFileName = `${post.$id}-playlist-${Date.now()}.m3u8`;
+    
+    const playlistUpload = await storage.createFile(
+      APPWRITE_BUCKET_ID,
+      ID.unique(),
+      InputFile.fromString(modifiedM3u8, playlistFileName)
+    );
+    
+    const m3u8Url = storage.getFileView(APPWRITE_BUCKET_ID, playlistUpload.$id);
+    log(`Modified playlist uploaded, URL: ${m3u8Url}`);
+    
+    // Обновляем прогресс UI
+    await updateUIProgress(postId, databases, PROCESSING_STEPS.CREATE_PLAYLIST, 100);
+    
+    // Шаг 7: FINALIZE - завершаем обработку и обновляем пост
+    log(`Starting finalization step for post ${postId}`);
+    
+    // Обновляем статус в БД
+    await safeUpdateDocument(
+      databases,
+      APPWRITE_DATABASE_ID,
+      APPWRITE_COLLECTION_ID_POST,
+      postId,
+      {
+        streaming_urls: [`processing-step:finalize:${executionRecord.$id}:${new Date().toISOString()}`],
+        mp3_url: mp3Url,
+        m3u8_url: m3u8Url,
+        segments: uploadedSegments,
+        processing_status: 'completed',
+        processing_completed_at: new Date().toISOString(),
+        audio_processing_progress: 100
+      }
+    );
+    
+    // Очищаем временные файлы
+    try {
+      fs.rmSync(tempDir, { recursive: true, force: true });
+      log(`Cleaned up temporary directory: ${tempDir}`);
+    } catch (cleanupError) {
+      logError(`Error cleaning up temporary directory:`, cleanupError);
+    }
+    
+    // Возвращаем результат успешной обработки
+    log(`Audio processing completed successfully for post ${postId}`);
+    return {
+      success: true,
+      message: 'Audio processing completed successfully',
+      postId,
+      executionId: executionRecord.$id,
+      mp3_url: mp3Url,
+      m3u8_url: m3u8Url,
+      process_time_ms: Date.now() - startTime
+    };
     
   } catch (error) {
     console.error('Error processing audio:', error);
     
-    // Обновляем пост с информацией об ошибке, используя только существующие поля и retry логику
+    // Обновляем пост с информацией об ошибке
     try {
       if (postId) {
         await safeUpdateDocument(
@@ -2321,24 +2514,23 @@ async function processAudio(postId, databases, storage, client, executionId = nu
           APPWRITE_COLLECTION_ID_POST,
           postId,
           {
-            // ИЗМЕНЕНО: Больше не используем description для логирования ошибок
-            processing_status: 'failed', // Устанавливаем статус failed
-            processing_error: error.message, // Сохраняем текст ошибки в отдельное поле
-            // Используем streaming_urls для хранения статуса
-            streaming_urls: [`processing-error:${executionRecord?.$id || 'unknown'}:${new Date().toISOString()}:${error.message}`]
+            processing_status: 'failed', // Используем 'failed' вместо 'error'
+            processing_error: error.message || 'Unknown error',
+            audio_processing_progress: 0
           }
         );
-        console.log(`Updated post ${postId} with error status`);
       }
     } catch (updateError) {
-      console.error('Error updating post with error status:', updateError);
+      logError('Error updating post with error status:', updateError);
     }
     
     return {
       success: false,
       message: `Error processing audio: ${error.message}`,
+      error: error.message || 'Unknown error',
       postId,
-      executionId: executionRecord.$id
+      executionId: executionRecord.$id,
+      process_time_ms: Date.now() - startTime
     };
   }
 }

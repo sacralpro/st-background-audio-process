@@ -1,31 +1,29 @@
 {
   "name": "st-background-audio-process",
   "version": "1.0.0",
-  "description": "Background audio processing for Sacral Track",
-  "main": "src/dist/index.js",
-  "type": "commonjs",
+  "description": "Background audio processing for streaming application",
+  "main": "src/appwriteFunction.js",
   "scripts": {
-    "build": "esbuild src/appwriteFunction.js --bundle --outfile=src/dist/index.js --platform=node --target=node16",
-    "old-build": "netlify-lambda build functions -c webpack.functions.js"
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "appwrite": "^11.0.0",
+    "node-appwrite": "^9.0.0",
+    "axios": "^1.4.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "dotenv": "^16.0.3",
+    "uuid": "^9.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   },
   "keywords": [
     "appwrite",
+    "function",
     "audio",
-    "processing"
+    "processing",
+    "streaming"
   ],
   "author": "",
-  "license": "ISC",
-  "dependencies": {
-    "axios": "^1.6.0",
-    "dotenv": "^16.3.1",
-    "fluent-ffmpeg": "^2.1.2",
-    "node-appwrite": "^9.0.0"
-  },
-  "devDependencies": {
-    "babel-loader": "^8.2.2",
-    "esbuild": "^0.20.2",
-    "netlify-lambda": "^2.0.16",
-    "webpack": "^4.47.0",
-    "webpack-node-externals": "^3.0.0"
-  }
+  "license": "MIT"
 }
