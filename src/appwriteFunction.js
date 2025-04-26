@@ -902,6 +902,24 @@ async function processUnprocessedPosts(databases, storage, client) {
 // Helper function to update UI progress
 async function updateUIProgress(postId, databases, step, progress, status = 'processing') {
   try {
+    // Сначала проверяем, обработан ли уже пост (есть ли у него mp3_url)
+    try {
+      const post = await databases.getDocument(
+        APPWRITE_DATABASE_ID,
+        APPWRITE_COLLECTION_ID_POST,
+        postId
+      );
+      
+      // Если mp3_url уже существует, прекращаем обработку
+      if (post.mp3_url) {
+        log(`Post ${postId} already has mp3_url: ${post.mp3_url}. Skipping UI progress update.`);
+        return true;
+      }
+    } catch (fetchError) {
+      logError(`Error fetching post to check mp3_url: ${fetchError.message}`);
+      // Продолжаем обновлять прогресс в случае ошибки проверки
+    }
+    
     const progressPercentage = getProgressPercentage(step, progress);
     
     // Подготовка данных для обновления - УДАЛЕНЫ лишние поля
@@ -1941,6 +1959,38 @@ async function processAudio(postId, databases, storage, client, executionId = nu
     );
     
     log(`Retrieved post ${post.$id}`);
+    
+    // НОВАЯ ПРОВЕРКА: Если у поста уже есть mp3_url или m3u8_url, прекращаем обработку
+    if (post.mp3_url || post.m3u8_url) {
+      log(`Post ${postId} already has processed audio: mp3_url=${!!post.mp3_url}, m3u8_url=${!!post.m3u8_url}. Skipping processing.`);
+      
+      // Устанавливаем статус completed, если он еще не установлен
+      if (post.processing_status !== 'completed') {
+        try {
+          await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_COLLECTION_ID_POST,
+            postId,
+            {
+              processing_status: 'completed'
+            }
+          );
+          log(`Updated processing_status to 'completed' for already processed post`);
+        } catch (e) {
+          logError(`Error updating processing_status for already processed post:`, e);
+        }
+      }
+      
+      return {
+        success: true,
+        message: 'Post already has processed audio',
+        postId,
+        executionId: executionRecord.$id,
+        alreadyProcessed: true,
+        mp3_url: post.mp3_url,
+        m3u8_url: post.m3u8_url
+      };
+    }
     
     // Check if we should start a new execution
     if (!executionId) {
