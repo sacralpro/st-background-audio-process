@@ -242,10 +242,18 @@ module.exports = async function(req, res) {
   // Инициализируем объект payload заранее
   let payload = {};
   let postId = null;
+  let context = null;
+  
+  // Проверяем, может быть у нас новый формат контекста Appwrite
+  if (req && req.req && req.res) {
+    context = req;
+    req = context.req || {};
+    res = context.res || {};
+  }
   
   // Правильно определяем функции логирования в соответствии с Appwrite
-  const log = (typeof req?.log === 'function') ? req.log : console.log;
-  const logError = (typeof req?.error === 'function') ? req.error : console.error;
+  const log = (context?.log || req?.log || console.log).bind(console);
+  const logError = (context?.error || req?.error || console.error).bind(console);
   
   log('Запуск функции обработки аудио');
   
@@ -300,26 +308,14 @@ module.exports = async function(req, res) {
     if (!postId) {
       log('No postId found in request');
       
-      // Безопасная отправка ответа, проверяем наличие res и метода json
-      if (res && typeof res.json === 'function') {
-      return res.json({
+      // Формируем ответ
+      const errorResponseNoPostId = {
         success: false,
-          message: 'No postId found in request'
-        });
-      } else if (typeof req?.json === 'function') {
-        // Новый API Appwrite использует context.req.json
-        return req.json({
-          success: false,
-          message: 'No postId found in request'
-        });
-      } else {
-        // Для контекста без res/req.json
-        logError('Cannot send response - no available response methods');
-        return {
-          success: false,
-          message: 'No postId found in request'
-        };
-      }
+        message: 'No postId found in request'
+      };
+      
+      // Безопасная отправка ответа, проверяем наличие методов ответа
+      return safeResponse(res, errorResponseNoPostId, context, log, logError);
     }
     
     // Остальная логика обработки запроса...
@@ -327,16 +323,7 @@ module.exports = async function(req, res) {
     const result = await simplifiedAudioProcessing(postId, null, databases, storage, client);
     
     // Безопасно отправляем ответ
-    if (res && typeof res.json === 'function') {
-      return res.json(result);
-    } else if (typeof req?.json === 'function') {
-      // Новый API Appwrite использует context.req.json
-      return req.json(result);
-    } else {
-      // Для контекста без res/req.json
-      log('Returning result as object (no response methods available)');
-      return result;
-    }
+    return safeResponse(res, result, context, log, logError);
     
   } catch (error) {
     logError('Error in main function:', error);
@@ -348,17 +335,63 @@ module.exports = async function(req, res) {
       stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
     };
     
-    if (res && typeof res.json === 'function') {
-      return res.json(errorResponse);
-    } else if (typeof req?.json === 'function') {
-      // Новый API Appwrite использует context.req.json
-      return req.json(errorResponse);
-    } else {
-      // Для контекста без res/req.json
-      return errorResponse;
-    }
+    return safeResponse(res, errorResponse, context, log, logError);
   }
 };
+
+// Улучшенная функция для безопасной отправки ответа, поддерживающая разные API
+function safeResponse(res, data, context, log, logError) {
+  // Проверяем наличие объекта ответа и методов
+  try {
+    // Первый способ: обычный Express-подобный res.json()
+    if (res && typeof res.json === 'function') {
+      log('Sending response using res.json()');
+      return res.json(data);
+    } 
+    
+    // Второй способ: Новый API Appwrite V2+
+    else if (context && typeof context.send === 'function') {
+      log('Sending response using context.send()');
+      return context.send(data);
+    }
+    
+    // Третий способ: Вариант с context.res
+    else if (context && context.res && typeof context.res.json === 'function') {
+      log('Sending response using context.res.json()');
+      return context.res.json(data);
+    }
+    
+    // Четвертый способ: req.json() (в некоторых реализациях Appwrite)
+    else if (context && context.req && typeof context.req.json === 'function') {
+      log('Sending response using context.req.json()');
+      return context.req.json(data);
+    }
+    
+    // Пятый способ: res.send()
+    else if (res && typeof res.send === 'function') {
+      log('Sending response using res.send()');
+      return res.send(JSON.stringify(data));
+    }
+    
+    // Шестой способ: Node.js HTTP response
+    else if (res && typeof res.end === 'function') {
+      log('Sending response using res.end()');
+      if (typeof res.setHeader === 'function') {
+        res.setHeader('Content-Type', 'application/json');
+      } else if (typeof res.writeHead === 'function') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+      }
+      return res.end(JSON.stringify(data));
+    }
+    
+    // Нет доступных методов отправки ответа
+    logError('No available response methods found. Returning data object directly.');
+    return data;
+  } catch (responseError) {
+    logError('Error sending response:', responseError);
+    return data;
+  }
+}
 
 // Упрощенная версия обработки аудио, делающая минимальное количество API-запросов
 async function simplifiedAudioProcessing(postId, existingPostData, databases, storage, client) {
@@ -1758,32 +1791,9 @@ async function processAudio(postId, databases, storage, client, executionId = nu
   }
 }
 
-// Вспомогательная функция для безопасной отправки JSON-ответа
+// Вспомогательная функция для безопасной отправки JSON-ответа (обновляем для совместимости)
 function safeJsonResponse(res, data, isContextPattern, log, error) {
-  // Защита от undefined res
-  if (!res) {
-    error('safeJsonResponse: res object is undefined');
-    return data;
-  }
-  
-  // Если используется шаблон с контекстом (context.res)
-  if (isContextPattern) {
-    if (typeof res.json === 'function') {
-      return res.json(data);
-    }
-  }
-  
-  // Для стандартного Node.js HTTP ответа
-  if (typeof res.json === 'function') {
-    return res.json(data);
-  } else if (typeof res.send === 'function') {
-    return res.send(JSON.stringify(data));
-  } else if (typeof res.end === 'function') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify(data));
-  }
-  
-  // Если мы не можем отправить ответ, логируем ошибку и возвращаем объект
-  error('Unable to send response: res object does not have required methods');
-  return data;
+  // Используем новую улучшенную функцию
+  const context = isContextPattern ? { res } : null;
+  return safeResponse(res, data, context, log, error);
 }
