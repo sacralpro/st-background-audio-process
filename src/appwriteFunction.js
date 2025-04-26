@@ -2271,30 +2271,108 @@ async function processAudio(postId, databases, storage, client, executionId = nu
     fs.mkdirSync(tempDir, { recursive: true });
     log(`Created temporary directory: ${tempDir}`);
     
-    // Загружаем аудио файл
-    const audioUrl = post.audio_url;
+    // Имя и путь для аудио файла
     const audioFileName = `original-${Date.now()}.mp3`;
     const audioFilePath = path.join(tempDir, audioFileName);
     
-    log(`Downloading audio from ${audioUrl}`);
+    // Флаг для пропуска скачивания через axios, если файл уже получен через SDK
+    let goto_convert_step = false;
     
-    // Загружаем файл используя axios или аналогичную библиотеку
-    const response = await axios({
-      method: 'get',
-      url: audioUrl,
-      responseType: 'stream'
-    });
+    // Загружаем аудио файл
+    let audioUrl = post.audio_url;
     
-    const writer = fs.createWriteStream(audioFilePath);
-    response.data.pipe(writer);
+    // Проверяем, является ли audio_url идентификатором файла Appwrite
+    // Шаблон для Appwrite ID: 20-30 символов, буквы и цифры
+    if (audioUrl && /^[a-zA-Z0-9]{20,30}$/.test(audioUrl)) {
+      log(`audio_url похоже на ID файла Appwrite: ${audioUrl}`);
+      try {
+        // Если доступен SDK для хранилища, используем его для прямого получения файла
+        if (typeof storage.getFileDownload === 'function') {
+          log(`Используем SDK для получения файла: ${audioUrl}`);
+          
+          // Получаем файл напрямую через SDK
+          const fileBlob = await storage.getFileDownload(APPWRITE_BUCKET_ID, audioUrl);
+          
+          // Сохраняем файл на диск
+          fs.writeFileSync(audioFilePath, Buffer.from(await fileBlob.arrayBuffer()));
+          log(`Файл успешно скачан через SDK: ${audioFilePath}`);
+          
+          // Пропускаем этап скачивания через axios
+          await updateUIProgress(postId, databases, PROCESSING_STEPS.DOWNLOAD, 100);
+          
+          // Переходим к следующему шагу
+          goto_convert_step = true;
+        } else {
+          // Если SDK не имеет метода для скачивания, создаем URL вручную
+          const endpoint = client.endpoint;
+          const projectId = client.config.project;
+          const fileUrl = `${endpoint}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${audioUrl}/download`;
+          
+          // Добавляем параметры проекта в URL
+          const downloadUrl = new URL(fileUrl);
+          downloadUrl.searchParams.append('project', projectId);
+          
+          log(`Получен URL для скачивания файла: ${downloadUrl.toString()}`);
+          audioUrl = downloadUrl.toString();
+        }
+      } catch (error) {
+        logError(`Ошибка при получении URL для скачивания файла: ${audioUrl}`, error);
+        throw new Error(`Не удалось получить URL для скачивания аудио файла: ${error.message}`);
+      }
+    } else if (!audioUrl.startsWith('http')) {
+      throw new Error('Некорректный формат audio_url: должен быть URL или ID файла Appwrite');
+    }
     
-    // Ждем загрузки файла
-    await new Promise((resolve, reject) => {
-      writer.on('finish', resolve);
-      writer.on('error', reject);
-    });
-    
-    log(`Audio downloaded to ${audioFilePath}`);
+    // Если файл еще не скачан через SDK, скачиваем его через axios
+    if (!goto_convert_step) {
+      log(`Downloading audio from ${audioUrl}`);
+      
+      // Загружаем файл используя axios или аналогичную библиотеку
+      try {
+        const response = await axios({
+          method: 'get',
+          url: audioUrl,
+          responseType: 'stream',
+          headers: audioUrl.includes('/storage/buckets/') ? {
+            // Если это URL из Appwrite, добавляем заголовок X-Appwrite-Project
+            'X-Appwrite-Project': client.config.project,
+            // Если доступен API ключ, также добавляем его
+            ...(client.config.key ? { 'X-Appwrite-Key': client.config.key } : {})
+          } : {}
+        });
+        
+        const writer = fs.createWriteStream(audioFilePath);
+        response.data.pipe(writer);
+        
+        // Ждем загрузки файла
+        await new Promise((resolve, reject) => {
+          writer.on('finish', resolve);
+          writer.on('error', reject);
+        });
+        
+        log(`Audio downloaded to ${audioFilePath}`);
+      } catch (error) {
+        const errorMessage = error.response 
+          ? `Ошибка при скачивании аудио: ${error.response.status} ${error.response.statusText}` 
+          : `Ошибка при скачивании аудио: ${error.message}`;
+        
+        logError(errorMessage, error);
+        
+        // Обновляем статус в БД
+        await safeUpdateDocument(
+          databases,
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          postId,
+          {
+            processing_status: 'failed',
+            processing_error: errorMessage
+          }
+        );
+        
+        throw new Error(errorMessage);
+      }
+    }
     
     // Обновляем прогресс UI
     await updateUIProgress(postId, databases, PROCESSING_STEPS.DOWNLOAD, 100);
