@@ -1055,11 +1055,11 @@ async function updateUIProgress(postId, databases, step, progress, status = 'pro
       
       // Если mp3_url уже существует, прекращаем обработку
       if (post.mp3_url) {
-        log(`Post ${postId} already has mp3_url: ${post.mp3_url}. Skipping UI progress update.`);
+        console.log(`Post ${postId} already has mp3_url: ${post.mp3_url}. Skipping UI progress update.`);
         return true;
       }
     } catch (fetchError) {
-      logError(`Error fetching post to check mp3_url: ${fetchError.message}`);
+      console.error(`Error fetching post to check mp3_url: ${fetchError.message}`);
       // Продолжаем обновлять прогресс в случае ошибки проверки
     }
     
@@ -1079,10 +1079,10 @@ async function updateUIProgress(postId, databases, step, progress, status = 'pro
       updateData
     );
     
-    log(`Updated UI progress for post ${postId}: ${step} - ${progressPercentage}%, status: ${status}`);
+    console.log(`Updated UI progress for post ${postId}: ${step} - ${progressPercentage}%, status: ${status}`);
     return true;
   } catch (error) {
-    logError(`Failed to update UI progress for post ${postId}:`, error);
+    console.error(`Failed to update UI progress for post ${postId}:`, error);
     return false;
   }
 }
@@ -2029,14 +2029,50 @@ async function retryWithBackoff(fn, maxRetries = 5, initialDelay = 2000) {
 
 // Обновляем функцию обновления документа, чтобы использовать retry логику
 async function safeUpdateDocument(databases, databaseId, collectionId, documentId, data) {
-  return retryWithBackoff(async () => {
-    return await databases.updateDocument(
+  try {
+    const result = await databases.updateDocument(
       databaseId,
       collectionId,
       documentId,
       data
     );
-  });
+    return result;
+  } catch (error) {
+    console.error(`Error updating document ${documentId}: ${error.message}`);
+    
+    // Если ошибка связана с лимитом размера полей, пытаемся использовать усеченную версию
+    if (
+      error.message.includes('maximum length') || 
+      error.message.includes('exceeds') ||
+      error.message.includes('too large')
+    ) {
+      console.log(`Detected size limit error, trying to update without problematic fields`);
+      
+      // Глубокое копирование данных для модификации
+      const safeData = JSON.parse(JSON.stringify(data));
+      
+      // Удаляем потенциально проблемные поля из данных
+      if (safeData.streaming_urls && safeData.streaming_urls.length > 20) {
+        safeData.streaming_urls = safeData.streaming_urls.slice(0, 20);
+      }
+      
+      try {
+        const result = await databases.updateDocument(
+          databaseId,
+          collectionId,
+          documentId,
+          safeData
+        );
+        console.log(`Successfully updated document ${documentId} with reduced data`);
+        return result;
+      } catch (secondError) {
+        console.error(`Second attempt to update document failed: ${secondError.message}`);
+        throw secondError;
+      }
+    }
+    
+    throw error;
+  }
 }
 
 // This function creates or updates execution records and helps divide work across multiple function calls
