@@ -2290,18 +2290,118 @@ async function processAudio(postId, databases, storage, client, executionId = nu
         if (typeof storage.getFileDownload === 'function') {
           log(`Используем SDK для получения файла: ${audioUrl}`);
           
-          // Получаем файл напрямую через SDK
-          const fileBlob = await storage.getFileDownload(APPWRITE_BUCKET_ID, audioUrl);
-          
-          // Сохраняем файл на диск
-          fs.writeFileSync(audioFilePath, Buffer.from(await fileBlob.arrayBuffer()));
-          log(`Файл успешно скачан через SDK: ${audioFilePath}`);
-          
-          // Пропускаем этап скачивания через axios
-          await updateUIProgress(postId, databases, PROCESSING_STEPS.DOWNLOAD, 100);
-          
-          // Переходим к следующему шагу
-          goto_convert_step = true;
+          try {
+            // Получаем файл напрямую через SDK
+            const fileData = await storage.getFileDownload(APPWRITE_BUCKET_ID, audioUrl);
+            
+            // Проверяем тип возвращаемых данных
+            if (fileData) {
+              // Логируем информацию о полученных данных для отладки
+              log(`Полученные данные: тип=${typeof fileData}, isBuffer=${Buffer.isBuffer(fileData)}, hasArrayBuffer=${typeof fileData.arrayBuffer === 'function'}, hasStream=${typeof fileData === 'object' && fileData.pipe ? 'да' : 'нет'}`);
+              
+              // Записываем данные в файл
+              // fileData должен быть уже в виде Buffer или stream
+              if (Buffer.isBuffer(fileData)) {
+                // Если это Buffer, записываем напрямую
+                fs.writeFileSync(audioFilePath, fileData);
+                log(`Файл успешно скачан через SDK (Buffer): ${audioFilePath}`);
+                goto_convert_step = true;
+              } else if (typeof fileData === 'object' && fileData.pipe) {
+                // Если это stream, используем pipe
+                const writer = fs.createWriteStream(audioFilePath);
+                fileData.pipe(writer);
+                await new Promise((resolve, reject) => {
+                  writer.on('finish', resolve);
+                  writer.on('error', reject);
+                });
+                log(`Файл успешно скачан через SDK (Stream): ${audioFilePath}`);
+                goto_convert_step = true;
+              } else if (typeof fileData.arrayBuffer === 'function') {
+                // Если это все-таки Blob или Response
+                fs.writeFileSync(audioFilePath, Buffer.from(await fileData.arrayBuffer()));
+                log(`Файл успешно скачан через SDK (Blob): ${audioFilePath}`);
+                goto_convert_step = true;
+              } else if (typeof fileData === 'string') {
+                // Если это строка (возможно, это base64 или другой формат)
+                log(`Получены данные в виде строки длиной ${fileData.length} символов`);
+                
+                // Проверяем, похоже ли это на base64
+                const isBase64 = /^[A-Za-z0-9+/=]+$/.test(fileData.replace(/\s/g, ''));
+                if (isBase64) {
+                  log('Данные похожи на base64, попытка декодирования');
+                  try {
+                    const buffer = Buffer.from(fileData, 'base64');
+                    fs.writeFileSync(audioFilePath, buffer);
+                    log(`Файл успешно скачан через SDK (String->Base64): ${audioFilePath}`);
+                    goto_convert_step = true;
+                  } catch (err) {
+                    logError('Ошибка при декодировании base64:', err);
+                    goto_convert_step = false;
+                  }
+                } else if (fileData.startsWith('http')) {
+                  // Если это URL, используем его напрямую
+                  log('Данные содержат URL, используем его напрямую');
+                  audioUrl = fileData;
+                  goto_convert_step = false;
+                } else {
+                  // Просто записываем строку как есть
+                  fs.writeFileSync(audioFilePath, fileData);
+                  log(`Файл успешно скачан через SDK (String): ${audioFilePath}`);
+                  goto_convert_step = true;
+                }
+              } else {
+                // Если ни один из методов не подходит, логируем и переходим к HTTP запросу
+                log(`Неизвестный формат ответа от SDK, переходим к HTTP запросу. Тип данных: ${typeof fileData}`);
+                // Создаем URL вручную
+                const endpoint = client.endpoint;
+                const projectId = client.config.project;
+                
+                try {
+                  const fileUrl = `${endpoint}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${audioUrl}/download`;
+                  const downloadUrl = new URL(fileUrl);
+                  downloadUrl.searchParams.append('project', projectId);
+                  
+                  log(`Создан URL для скачивания файла: ${downloadUrl.toString()}`);
+                  audioUrl = downloadUrl.toString();
+                } catch (urlError) {
+                  logError(`Ошибка при создании URL для скачивания:`, urlError);
+                  // Если не удалось создать URL, возможно, аудио является абсолютным URL
+                  if (!audioUrl.startsWith('http')) {
+                    throw new Error(`Не удалось создать корректный URL для скачивания: ${urlError.message}`);
+                  }
+                  log(`Используем исходный URL: ${audioUrl}`);
+                }
+                
+                goto_convert_step = false;
+                // Здесь нельзя использовать return, так как мы находимся внутри блока if
+                // Просто завершаем этот блок и продолжаем выполнение
+              }
+              
+              // Продолжаем только если файл был успешно скачан через SDK
+              if (goto_convert_step) {
+                // Пропускаем этап скачивания через axios
+                await updateUIProgress(postId, databases, PROCESSING_STEPS.DOWNLOAD, 100);
+              }
+            } else {
+              throw new Error('SDK не вернул данные файла');
+            }
+          } catch (error) {
+            logError(`Ошибка при получении файла через SDK: ${error.message}`, error);
+            
+            // Переходим к альтернативному способу через URL
+            log('Переходим к альтернативному способу получения через URL');
+            
+            // Создаем URL вручную
+            const endpoint = client.endpoint;
+            const projectId = client.config.project;
+            const fileUrl = `${endpoint}/storage/buckets/${APPWRITE_BUCKET_ID}/files/${audioUrl}/download`;
+            
+            const downloadUrl = new URL(fileUrl);
+            downloadUrl.searchParams.append('project', projectId);
+            
+            audioUrl = downloadUrl.toString();
+            goto_convert_step = false;
+          }
         } else {
           // Если SDK не имеет метода для скачивания, создаем URL вручную
           const endpoint = client.endpoint;
