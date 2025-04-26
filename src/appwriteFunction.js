@@ -620,31 +620,64 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
         updatedStreamingUrls = [newStreamingUrl];
       }
       
-      // Обрабатываем description, чтобы не превышал 999 символов
-      let updatedDescription = post.description || "";
-      const processingMsg = `[Processing started at ${new Date().toISOString()} from ${source}]`;
-      
-      // Ограничиваем общую длину до 950 символов, чтобы оставить место для сообщения о процессе
-      if (updatedDescription.length > 950) {
-        updatedDescription = updatedDescription.substring(0, 945) + "...";
+      // Проверяем длину description перед обновлением
+      try {
+        // Обрабатываем description, чтобы не превышал 999 символов
+        let updatedDescription = post.description || "";
+        const processingMsg = `[Processing started at ${new Date().toISOString()} from ${source}]`;
+        
+        // Ограничиваем общую длину до 900 символов, чтобы оставить место для сообщения о процессе
+        if (updatedDescription.length > 900) {
+          updatedDescription = updatedDescription.substring(0, 895) + "...";
+        }
+        
+        // Добавляем сообщение о начале обработки
+        updatedDescription = updatedDescription ? `${updatedDescription}\n${processingMsg}` : processingMsg;
+        
+        // Проверяем, что длина не превышает 999 символов
+        if (updatedDescription && updatedDescription.length <= 999) {
+          await retryWithBackoff(async () => {
+            return await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_COLLECTION_ID_POST,
+              postId,
+              {
+                streaming_urls: updatedStreamingUrls,
+                description: updatedDescription
+              }
+            );
+          }, 5, 3000);
+        } else {
+          // Если description слишком длинный, обновляем только streaming_urls
+          console.log(`[${executionId}] Description is too long (${updatedDescription?.length || 0} chars), updating only streaming_urls`);
+          await retryWithBackoff(async () => {
+            return await databases.updateDocument(
+              APPWRITE_DATABASE_ID,
+              APPWRITE_COLLECTION_ID_POST,
+              postId,
+              {
+                streaming_urls: updatedStreamingUrls
+              }
+            );
+          }, 5, 3000);
+        }
+        
+        console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
+      } catch (descError) {
+        console.error(`[${executionId}] Error with description field:`, descError);
+        // Если ошибка связана с description, обновляем только streaming_urls
+        await retryWithBackoff(async () => {
+          return await databases.updateDocument(
+            APPWRITE_DATABASE_ID,
+            APPWRITE_COLLECTION_ID_POST,
+            postId,
+            {
+              streaming_urls: updatedStreamingUrls
+            }
+          );
+        }, 5, 3000);
+        console.log(`[${executionId}] Updated post with streaming_urls only due to description error`);
       }
-      
-      // Добавляем сообщение о начале обработки
-      updatedDescription = updatedDescription ? `${updatedDescription}\n${processingMsg}` : processingMsg;
-      
-      await retryWithBackoff(async () => {
-        return await databases.updateDocument(
-          APPWRITE_DATABASE_ID,
-          APPWRITE_COLLECTION_ID_POST,
-          postId,
-          {
-            streaming_urls: updatedStreamingUrls,
-            description: updatedDescription
-          }
-        );
-      }, 5, 3000);
-      
-      console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
     } catch (error) {
       console.error(`[${executionId}] Error updating post with processing start info:`, error);
       // Не прекращаем выполнение в случае ошибки обновления
