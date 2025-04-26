@@ -904,13 +904,10 @@ async function updateUIProgress(postId, databases, step, progress, status = 'pro
   try {
     const progressPercentage = getProgressPercentage(step, progress);
     
-    // Подготовка данных для обновления
+    // Подготовка данных для обновления - УДАЛЕНЫ лишние поля
     const updateData = {
       audio_processing_progress: progressPercentage,
-      audio_processing_step: step,
-      audio_processing_status: status,
-      audio_processing_updated_at: new Date().toISOString(),
-      // НОВОЕ: Обновляем также общий статус обработки
+      // Оставляем только основные поля
       processing_status: status
     };
     
