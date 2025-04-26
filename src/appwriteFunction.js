@@ -511,6 +511,22 @@ module.exports = async function(req, res) {
     
     // Логируем количество запусков для этого поста
     const currentCount = postExecutionCounts.get(postId) || 0;
+    
+    // НОВОЕ: Проверяем, не превышено ли максимальное количество выполнений (5 раз)
+    if (currentCount >= 5) {
+      log(`[${executionId}] Maximum number of executions (5) reached for post ${postId}. Blocking further attempts.`);
+      
+      return safeResponse(res, {
+        success: false,
+        message: `Post has reached the maximum number of processing attempts (5).`,
+        postId,
+        executionId,
+        maxExecutionsReached: true,
+        executionCount: currentCount,
+        executionTime: `${Date.now() - startTime}ms`
+      }, context, log, logError);
+    }
+    
     postExecutionCounts.set(postId, currentCount + 1);
     log(`[${executionId}] Starting execution #${currentCount + 1} for post ${postId}`);
     
@@ -1573,7 +1589,7 @@ async function processContinuationSegmentUpload(post, req, res, databases, stora
         APPWRITE_COLLECTION_ID_POST,
         post.$id,
         {
-          processing_status: 'error',
+          processing_status: 'failed', // Изменено с 'error' на 'failed'
           processing_error: `Error in segment upload: ${error.message}`,
           processing_continuation_scheduled: false
         }
@@ -1703,7 +1719,7 @@ async function processContinuationPlaylistCreation(post, req, res, databases, st
         APPWRITE_COLLECTION_ID_POST,
         post.$id,
         {
-          processing_status: 'error',
+          processing_status: 'failed', // Изменено с 'error' на 'failed'
           processing_error: `Error in playlist creation: ${error.message}`,
           processing_continuation_scheduled: false
         }
