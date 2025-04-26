@@ -254,6 +254,8 @@ module.exports = async function(req, res) {
   let context = null;
   let source = 'unknown';
   let isTest = false;
+  let isContinuation = false;      // НОВОЕ: флаг продолжения обработки
+  let continuationExecutionId = null; // НОВОЕ: ID первоначального выполнения
   
   // Проверяем, может быть у нас новый формат контекста Appwrite
   if (req && req.req && req.res) {
@@ -305,6 +307,18 @@ module.exports = async function(req, res) {
     // Логируем ключи в payload для отладки
     log(`[${executionId}] Payload keys: ${Object.keys(payload).join(', ')}`);
     
+    // НОВОЕ: Проверяем, является ли запрос продолжением обработки
+    if (payload.continuation === true) {
+      isContinuation = true;
+      log(`[${executionId}] Continuation request detected`);
+      
+      // Если указан ID выполнения, используем его для логирования
+      if (payload.execution_id) {
+        continuationExecutionId = payload.execution_id;
+        log(`[${executionId}] Continuing execution ${continuationExecutionId}`);
+      }
+    }
+    
     // Проверяем источник запроса
     if (payload.source) {
       source = payload.source;
@@ -337,6 +351,9 @@ module.exports = async function(req, res) {
     if (payload && payload.postId) {
       postId = payload.postId;
       log(`[${executionId}] Using postId from payload: ${postId}`);
+    } else if (payload && payload.id) {
+      postId = payload.id;
+      log(`[${executionId}] Using id from payload as postId: ${postId}`);
     } else if (req) {
       // Пытаемся извлечь postId из других источников
       postId = extractPostId(req, 
@@ -362,7 +379,86 @@ module.exports = async function(req, res) {
       return safeResponse(res, errorResponseNoPostId, context, log, logError);
     }
     
-    // НОВОЕ: Если функция уже выполняется для этого поста, избегаем запуска еще одного выполнения
+    // НОВОЕ: Если это запрос на продолжение обработки, пропускаем некоторые проверки
+    if (isContinuation) {
+      log(`[${executionId}] Skipping processing lock checks for continuation request`);
+      
+      try {
+        // Получаем документ поста для определения текущего шага
+        const post = await databases.getDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          postId
+        );
+        
+        // Определяем текущий шаг обработки на основе данных в document
+        let currentStep = null;
+        
+        // Ищем информацию о текущем шаге в streaming_urls
+        const progressEntries = (post.streaming_urls || []).filter(url => 
+          typeof url === 'string' && url.startsWith('progress:')
+        );
+        
+        if (progressEntries.length > 0) {
+          // Берем последнюю запись о прогрессе
+          const latestProgress = progressEntries[0];
+          const progressParts = latestProgress.split(':');
+          
+          if (progressParts.length > 1) {
+            currentStep = progressParts[1];
+            log(`[${executionId}] Found current step in streaming_urls: ${currentStep}`);
+          }
+        }
+        
+        if (!currentStep && post.processing_status === 'processing') {
+          // Если шаг не найден, но статус processing, продолжаем с загрузки
+          currentStep = PROCESSING_STEPS.DOWNLOAD;
+          log(`[${executionId}] No step found, but status is processing. Continuing with download step`);
+        }
+        
+        // Выполняем соответствующий шаг обработки
+        let result;
+        if (currentStep === PROCESSING_STEPS.DOWNLOAD) {
+          result = await processContinuationDownload(post, req, res, databases, storage, { $id: continuationExecutionId || executionId }, startTime);
+        } else if (currentStep === PROCESSING_STEPS.CONVERT) {
+          result = await processContinuationFFmpeg(post, req, res, databases, storage, { $id: continuationExecutionId || executionId }, startTime);
+        } else if (currentStep === PROCESSING_STEPS.SEGMENT) {
+          result = await processContinuationPlaylistPreparation(post, req, res, databases, storage, { $id: continuationExecutionId || executionId }, startTime);
+        } else if (currentStep === PROCESSING_STEPS.UPLOAD_SEGMENTS) {
+          result = await processContinuationSegmentUpload(post, req, res, databases, storage, { $id: continuationExecutionId || executionId }, startTime);
+        } else if (currentStep === PROCESSING_STEPS.CREATE_PLAYLIST) {
+          result = await processContinuationPlaylistCreation(post, req, res, databases, storage, { $id: continuationExecutionId || executionId }, startTime);
+        } else {
+          // Если не можем определить шаг, начинаем с первого шага
+          log(`[${executionId}] Could not determine current processing step, restarting from initialize`);
+          result = await processAudio(postId, databases, storage, client, continuationExecutionId || executionId);
+        }
+        
+        // Отправляем результат
+        return safeResponse(res, {
+          ...result,
+          isContinuation: true,
+          executionId: continuationExecutionId || executionId,
+          executionTime: `${Date.now() - startTime}ms`
+        }, context, log, logError);
+        
+      } catch (continuationError) {
+        logError(`[${executionId}] Error processing continuation:`, continuationError);
+        
+        return safeResponse(res, {
+          success: false,
+          message: `Error processing continuation: ${continuationError.message}`,
+          postId,
+          executionId,
+          isContinuation: true,
+          executionTime: `${Date.now() - startTime}ms`
+        }, context, log, logError);
+      }
+    }
+    
+    // НОВОЕ: Проверка выполняется только если это не запрос на продолжение
+    
+    // Если функция уже выполняется для этого поста, избегаем запуска еще одного выполнения
     if (processingPosts.has(postId)) {
       const processingStartTime = processingPosts.get(postId);
       const now = Date.now();
@@ -1440,13 +1536,67 @@ async function scheduleContinuationTask(postId, post, executionId, delaySeconds 
       }
     );
     
-    // ВАЖНО: Вместо автоматического планирования, просто логируем намерение
-    log(`[scheduleContinuationTask] Continuation task scheduled for post ${postId}. Next step should be executed manually or via external scheduler.`);
+    // НОВОЕ: Реально планируем следующий шаг с помощью Appwrite Client SDK
+    try {
+      // Создаем таймаут, который выполнится через указанное количество секунд
+      setTimeout(async () => {
+        try {
+          log(`[scheduleContinuationTask] Executing continuation task for post ${postId}`);
+          
+          // Создаем вызов к API для продолжения обработки
+          const endpoint = `${process.env.APPWRITE_FUNCTION_ENDPOINT}/functions/${process.env.APPWRITE_FUNCTION_ID}/executions`;
+          
+          // Подготавливаем данные для выполнения
+          const payload = {
+            id: postId,
+            execution_id: executionId,
+            continuation: true
+          };
+          
+          // Если client доступен и есть метод call
+          if (client && client.functions && typeof client.functions.createExecution === 'function') {
+            // Вызываем функцию через клиент Appwrite
+            const execution = await client.functions.createExecution(
+              process.env.APPWRITE_FUNCTION_ID,
+              JSON.stringify(payload),
+              false, // isAsync
+              '', // path
+              'POST', // method
+              {} // headers
+            );
+            
+            log(`[scheduleContinuationTask] Successfully executed continuation, execution ID: ${execution.$id}`);
+          } else {
+            // Если клиента нет, используем вызов по HTTP
+            const response = await fetch(endpoint, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Appwrite-Key': process.env.APPWRITE_API_KEY
+              },
+              body: JSON.stringify({
+                data: JSON.stringify(payload),
+                async: false
+              })
+            });
+            
+            const result = await response.json();
+            log(`[scheduleContinuationTask] Continuation task executed via HTTP, result: ${JSON.stringify(result)}`);
+          }
+        } catch (execError) {
+          logError(`[scheduleContinuationTask] Error during continuation execution: ${execError.message}`, execError);
+        }
+      }, delaySeconds * 1000);
+      
+      log(`[scheduleContinuationTask] Continuation task scheduled for post ${postId} to execute in ${delaySeconds} seconds`);
+    } catch (schedulingError) {
+      logError(`[scheduleContinuationTask] Error scheduling actual continuation: ${schedulingError.message}`);
+    }
     
-    // Возвращаем успешный результат, но без реального планирования
+    // Возвращаем успешный результат
     return {
       success: true,
-      message: `Continuation task scheduled for post ${postId}. Execute manually.`,
+      message: `Continuation task scheduled for post ${postId} to execute in ${delaySeconds} seconds`,
       continuationCount: continuationCount + 1
     };
   } catch (error) {
