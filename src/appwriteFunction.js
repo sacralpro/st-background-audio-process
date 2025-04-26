@@ -757,59 +757,23 @@ async function simplifiedAudioProcessing(postId, providedPost = null, databases,
         updatedStreamingUrls = [newStreamingUrl];
       }
       
-      // Проверяем длину description перед обновлением
-      try {
-        // Обрабатываем description, чтобы не превышал 999 символов
-        let updatedDescription = post.description || "";
-        const processingMsg = `[Processing started at ${new Date().toISOString()} from ${source}]`;
-        
-        // Ограничиваем общую длину до 900 символов, чтобы оставить место для сообщения о процессе
-        if (updatedDescription.length > 900) {
-          updatedDescription = updatedDescription.substring(0, 895) + "...";
-        }
-        
-        // Добавляем сообщение о начале обработки
-        updatedDescription = updatedDescription ? `${updatedDescription}\n${processingMsg}` : processingMsg;
-        
-        // НОВОЕ: Устанавливаем processing_status как 'processing'
-        const updateData = {
-          streaming_urls: updatedStreamingUrls,
-          processing_status: 'processing'  // Новое поле для отслеживания статуса
-        };
-        
-        // Проверяем, что длина не превышает 999 символов
-        if (updatedDescription && updatedDescription.length <= 999) {
-          updateData.description = updatedDescription;
-        } else {
-          console.log(`[${executionId}] Description is too long (${updatedDescription?.length || 0} chars), not including in update`);
-        }
-        
-        await retryWithBackoff(async () => {
-          return await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_COLLECTION_ID_POST,
-            postId,
-            updateData
-          );
-        }, 5, 3000);
-        
-        console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
-      } catch (descError) {
-        console.error(`[${executionId}] Error with description field:`, descError);
-        // Если ошибка связана с description, обновляем только streaming_urls и processing_status
-        await retryWithBackoff(async () => {
-          return await databases.updateDocument(
-            APPWRITE_DATABASE_ID,
-            APPWRITE_COLLECTION_ID_POST,
-            postId,
-            {
-              streaming_urls: updatedStreamingUrls,
-              processing_status: 'processing'
-            }
-          );
-        }, 5, 3000);
-        console.log(`[${executionId}] Updated post with streaming_urls and processing_status only due to description error`);
-      }
+      // ИЗМЕНЕНО: Больше не обновляем поле description, используем только streaming_urls
+      const updateData = {
+        streaming_urls: updatedStreamingUrls,
+        processing_status: 'processing'
+      };
+      
+      await retryWithBackoff(async () => {
+        return await databases.updateDocument(
+          APPWRITE_DATABASE_ID,
+          APPWRITE_COLLECTION_ID_POST,
+          postId,
+          updateData
+        );
+      }, 5, 3000);
+      
+      console.log(`[${executionId}] Successfully updated post ${postId} to mark as processing`);
+      
     } catch (error) {
       console.error(`[${executionId}] Error updating post with processing start info:`, error);
       // Не прекращаем выполнение в случае ошибки обновления
@@ -1877,7 +1841,9 @@ async function manageProcessingExecution(post, currentStep, databases, client, o
       postId,
       {
         // Сохраняем информацию о прогрессе в первый элемент массива streaming_urls
-        streaming_urls: [`progress:${currentStep}:${executionId}:${new Date().toISOString()}`]
+        streaming_urls: [`progress:${currentStep}:${executionId}:${new Date().toISOString()}`],
+        // НОВОЕ: Обновляем статус обработки
+        processing_status: 'processing'
       }
     );
     
@@ -2028,7 +1994,9 @@ async function processAudio(postId, databases, storage, client, executionId = nu
         postId,
         {
           // Используем поле streaming_urls для хранения информации о процессе
-          streaming_urls: [`processing:${executionRecord.$id}:${new Date().toISOString()}`]
+          streaming_urls: [`processing:${executionRecord.$id}:${new Date().toISOString()}`],
+          // НОВОЕ: Добавляем поле processing_status
+          processing_status: 'processing'
         }
       );
       
@@ -2140,10 +2108,11 @@ async function processAudio(postId, databases, storage, client, executionId = nu
           APPWRITE_COLLECTION_ID_POST,
           postId,
           {
-            // Сохраняем информацию об ошибке в description или другое текстовое поле
-            description: `Error processing audio: ${error.message}`,
-            // Также можем использовать streaming_urls для хранения статуса
-            streaming_urls: [`error:${error.message}:${new Date().toISOString()}`]
+            // ИЗМЕНЕНО: Больше не используем description для логирования ошибок
+            processing_status: 'failed', // Устанавливаем статус failed
+            processing_error: error.message, // Сохраняем текст ошибки в отдельное поле
+            // Используем streaming_urls для хранения статуса
+            streaming_urls: [`processing-error:${executionRecord?.$id || 'unknown'}:${new Date().toISOString()}:${error.message}`]
           }
         );
         console.log(`Updated post ${postId} with error status`);
